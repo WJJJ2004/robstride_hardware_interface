@@ -8,6 +8,7 @@
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <cerrno>
 #include <thread>
 
@@ -33,6 +34,7 @@ bool CanTransport::open(const std::string& interface_name)
 
     // 인터페이스 이름 복사
     struct ifreq ifr;
+    std::memset(&ifr, 0, sizeof(ifr));
     std::strncpy(ifr.ifr_name, interface_name.c_str(), IFNAMSIZ - 1);
 
     // 복사한 인터페이스 이름으로 인덱스 가져오기
@@ -54,6 +56,18 @@ bool CanTransport::open(const std::string& interface_name)
         perror("Socket bind failed");
         close();
         return false;
+    }
+
+    // Non-blocking: prevent write()/read() from blocking the control loop.
+    // Without this, CAN TX can block indefinitely under bus congestion.
+    const int flags = fcntl(socket_fd_, F_GETFL, 0);
+    if (flags < 0)
+    {
+        perror("fcntl(F_GETFL) failed");
+    }
+    else if (fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        perror("fcntl(F_SETFL, O_NONBLOCK) failed");
     }
 
     // 송신 버퍼 크기 증가 (기본값이 작아서 빠른 전송 시 ENOBUFS 발생)
@@ -189,6 +203,11 @@ bool CanTransport::receive(uint32_t& can_id, std::vector<uint8_t>& data, int tim
 
         if (nbytes < 0)
         {
+            // Non-blocking socket can race: poll says readable but read returns EAGAIN.
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                return false;
+            }
             perror("Read error");
             return false;
         }

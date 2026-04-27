@@ -25,6 +25,10 @@ target_include_directories(${PROJECT_NAME}_lib PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
+ament_target_dependencies(${PROJECT_NAME}_lib
+  rclcpp
+)
+
 add_executable(hardware_interface_node
   src/MainControl.cpp
 )
@@ -52,6 +56,11 @@ install(TARGETS
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/can_setup.sh
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY launch

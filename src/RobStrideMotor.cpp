@@ -1,5 +1,5 @@
 #include "robstride_rdk_ros2/RobStrideMotor.hpp"
-#include <iostream>
+#include <rclcpp/rclcpp.hpp>
 
 RobStrideMotor::RobStrideMotor(std::shared_ptr<CanTransport> transport, uint8_t motor_id, ActuatorType type)
     : transport_(transport), motor_id_(motor_id), type_(type)
@@ -48,7 +48,10 @@ bool RobStrideMotor::enable()
 
     if (transport_->send(id, data))
     {
-        std::cout << "Motor " << (int)motor_id_ << " Enable Command Sent." << std::endl;
+        RCLCPP_INFO(
+            rclcpp::get_logger("robstride_motor"),
+            "Motor %u Enable Command Sent.",
+            static_cast<unsigned>(motor_id_));
         return true;
     }
     return false;
@@ -63,7 +66,10 @@ bool RobStrideMotor::disable()
 
     if (transport_->send(id, data))
     {
-        std::cout << "Motor " << (int)motor_id_ << " Disable Command Sent." << std::endl;
+        RCLCPP_INFO(
+            rclcpp::get_logger("robstride_motor"),
+            "Motor %u Disable Command Sent.",
+            static_cast<unsigned>(motor_id_));
         return true;
     }
     return false;

@@ -106,10 +106,10 @@ bool MainControlNode::canSetup()
         }
 
         execute_command("sudo ip link set " + can_name + " down 2>&1");
-        execute_command("sudo ip link set " + can_name +
-                        " up type can bitrate " + std::to_string(baud_rate) + " 2>&1");
+        execute_command("sudo ip link set " + can_name +" type can bitrate " + std::to_string(baud_rate) + " echo off 2>&1");
+        execute_command("sudo ip link set " + can_name + " up 2>&1");
         execute_command("sleep 0.2");
-
+        execute_command("sudo ip link set " + can_name + " txqueuelen 4096 2>&1");
         result = execute_command("ip -details link show " + can_name + " 2>&1");
 
         const bool is_up = (result.find("state UP") != std::string::npos);
@@ -143,6 +143,8 @@ void MainControlNode::resetRuntimeStates()
     init_tick_count_ = 0;
     start_positions_.clear();
 
+    consecutive_good_read_cycles_ = 0;
+
     packet_initialized_ = false;
 
     for (auto& group : can_groups_)
@@ -162,11 +164,11 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
 
     initParameters();
 
-    if (!canSetup())
-    {
-        RCLCPP_ERROR(this->get_logger(), "[Configure] CAN setup failed");
-        return CallbackReturn::FAILURE;
-    }
+    // if (!canSetup())
+    // {
+    //     RCLCPP_ERROR(this->get_logger(), "[Configure] CAN setup failed");
+    //     return CallbackReturn::FAILURE;
+    // }
 
     rclcpp::QoS cmd_qos(rclcpp::KeepLast(1));
     cmd_qos.reliable();
@@ -278,12 +280,12 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
         "[Configure] Configured successfully with %zu CAN interfaces, %zu total motors",
         can_groups_.size(), all_motors_.size());
 
-    velocity_filters_.clear();
-    velocity_filters_.reserve(all_motors_.size());
-    for (size_t i = 0; i < all_motors_.size(); i++)
-    {
-        velocity_filters_.emplace_back(23.0f);
-    }
+    // velocity_filters_.clear();
+    // velocity_filters_.reserve(all_motors_.size());
+    // for (size_t i = 0; i < all_motors_.size(); i++)
+    // {
+    //     velocity_filters_.emplace_back(23.0f);
+    // }
     last_velocity_filter_time_ = std::chrono::steady_clock::now();
     velocity_filter_time_initialized_ = false;
 
@@ -311,13 +313,13 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
             return CallbackReturn::FAILURE;
         }
     }
-
     walk_initialized_ = false;
     start_positions_captured_ = false;
     init_tick_count_ = 0;
+    consecutive_good_read_cycles_ = 0;
     current_state = ControlState::READ_PACKET;
     timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(5),
+        std::chrono::milliseconds(10), // 50 hz timer
         std::bind(&MainControlNode::control_loop, this));
 
     RCLCPP_INFO(this->get_logger(),
@@ -329,6 +331,10 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
 
 void MainControlNode::control_loop()
 {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+    "[Loop] current_state=%s",
+    (current_state == ControlState::READ_PACKET ? "READ" : "WRITE"));
+
     static auto last_print_time = std::chrono::steady_clock::now();
     static int write_count = 0;
 
@@ -430,9 +436,14 @@ void MainControlNode::handle_read_packet()
     uint32_t rx_id = 0;
     std::vector<uint8_t> rx_data;
 
+    // Bound how long READ can run so we don't starve WRITE / callbacks.
+    const auto read_budget = std::chrono::milliseconds(2);
+    const auto read_start = std::chrono::steady_clock::now();
+    bool budget_exhausted = false;
+
     for (auto& group : can_groups_)
     {
-        while (group.transport->receive(rx_id, rx_data, 0))
+        while (!budget_exhausted && group.transport->receive(rx_id, rx_data, 0))
         {
             const uint8_t motor_id = RobStrideProtocol::getMotorIdFromCanId(rx_id);
 
@@ -451,7 +462,32 @@ void MainControlNode::handle_read_packet()
                 }
                 break;
             }
+
+            if (std::chrono::steady_clock::now() - read_start > read_budget)
+            {
+                budget_exhausted = true;
+            }
         }
+
+        if (budget_exhausted)
+        {
+            break;
+        }
+    }
+
+    if (!walk_initialized_ && !start_positions_captured_)
+    {
+        bool all_motors_updated = !current_cycle_updated.empty();
+        for (const bool updated : current_cycle_updated)
+        {
+            if (!updated)
+            {
+                all_motors_updated = false;
+                break;
+            }
+        }
+
+        consecutive_good_read_cycles_ = all_motors_updated ? (consecutive_good_read_cycles_ + 1) : 0;
     }
 
     auto msg = roa_interfaces::msg::MotorStateArray();
@@ -459,26 +495,18 @@ void MainControlNode::handle_read_packet()
     msg.header.stamp = this->get_clock()->now();
     msg.header.frame_id = "motor_states";
 
-    for (size_t i = 0; i < all_motors_.size(); ++i)
-    msg.layout.dim[1].label = "width";
-    msg.layout.dim[1].size = width_cols;
-    msg.layout.dim[1].stride = width_cols;
-
-    msg.data.resize(height_rows * width_cols);
-    int data_idx = 0;
-
-    auto current_time = std::chrono::steady_clock::now();
-    float dt_sec = 0.01f;
-    if (velocity_filter_time_initialized_)
-    {
-        dt_sec = std::chrono::duration<float>(current_time - last_velocity_filter_time_).count();
-    }
-    if (dt_sec <= 0.0f || dt_sec > 0.1f)
-    {
-        dt_sec = 0.01f;
-    }
-    last_velocity_filter_time_ = current_time;
-    velocity_filter_time_initialized_ = true;
+    // auto current_time = std::chrono::steady_clock::now();
+    // float dt_sec = 0.01f;
+    // if (velocity_filter_time_initialized_)
+    // {
+    //     dt_sec = std::chrono::duration<float>(current_time - last_velocity_filter_time_).count();
+    // }
+    // if (dt_sec <= 0.0f || dt_sec > 0.1f)
+    // {
+    //     dt_sec = 0.01f;
+    // }
+    // last_velocity_filter_time_ = current_time;
+    // velocity_filter_time_initialized_ = true;
 
     for (size_t i = 0; i < all_motors_.size(); i++)
     {
@@ -513,7 +541,7 @@ void MainControlNode::handle_read_packet()
             msg.states[i].position = wrapToPi(static_cast<float>(all_motors_[i]->getPosition()));
             msg.states[i].velocity = static_cast<float>(all_motors_[i]->getVelocity());
             msg.states[i].current  = static_cast<float>(all_motors_[i]->getCurrent());
-            
+
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "[Read] bus=%s packet_index=%zu motor_id=%u update failed (success=%d fail=%d)",
                 packet_index_to_bus_[i].c_str(),
@@ -524,7 +552,9 @@ void MainControlNode::handle_read_packet()
         }
     }
 
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "[Read] BEFORE_PUBLISH");
     state_pub->publish(msg);
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "[Read] AFTER_PUBLISH");
     transition_to(ControlState::WRITE_PACKET);
 }
 
@@ -545,12 +575,30 @@ void MainControlNode::logWriteSummaryThrottle()
 
 void MainControlNode::handle_write_packet()
 {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+    "[Write] ENTER packet_initialized=%s walk_initialized=%s",
+    packet_initialized_ ? "true" : "false",
+    walk_initialized_ ? "true" : "false");
+
+
     std::lock_guard<std::mutex> lock(command_mutex_);
+
 
     if (!packet_initialized_)
     {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
             "[Write] packet_commands_ not initialized yet");
+        transition_to(ControlState::READ_PACKET);
+        return;
+    }
+
+    if (!walk_initialized_ && !start_positions_captured_ &&
+        consecutive_good_read_cycles_ < REQUIRED_GOOD_READ_CYCLES)
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "[InitGate] Waiting read: good_streak=%d/%d",
+            consecutive_good_read_cycles_,
+            REQUIRED_GOOD_READ_CYCLES);
         transition_to(ControlState::READ_PACKET);
         return;
     }

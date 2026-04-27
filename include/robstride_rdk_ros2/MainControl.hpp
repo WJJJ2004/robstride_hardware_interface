@@ -92,7 +92,6 @@ private:
     bool canSetup();
     void toCSV(float pos, float vel);
 
-    void canSetup();
     std::string execute_command(const std::string& cmd);
 
     WriteResult safeSendCommand(
@@ -137,6 +136,10 @@ private:
     std::vector<float> start_positions_;
     int init_tick_count_ = 0;
     static constexpr int INIT_TOTAL_TICKS = 100;
+
+    // Init gate: require consecutive full-state reads before capturing start positions
+    int consecutive_good_read_cycles_ = 0;
+    static constexpr int REQUIRED_GOOD_READ_CYCLES = 5;
 
     std::unordered_map<uint16_t, size_t> motor_id_to_index_;
 
