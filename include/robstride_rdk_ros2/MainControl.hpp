@@ -89,7 +89,8 @@ private:
     void transition_to(ControlState new_state);
     void initParameters();
 
-    bool canSetup();
+    // NOTE: use can-setup.sh to set up CAN interfaces before running. This function is a placeholder if we want to do dynamic setup in the future.
+    // bool canSetup(); 
     void toCSV(float pos, float vel);
 
     std::string execute_command(const std::string& cmd);

@@ -75,66 +75,66 @@ std::string MainControlNode::execute_command(const std::string& cmd)
     return result;
 }
 
-bool MainControlNode::canSetup()
-{
-    const auto can_interfaces = get_parameter("can_interfaces").as_string_array();
-    const auto baud_rate = get_parameter("baud_rate").as_int();
+// bool MainControlNode::canSetup()
+// {
+//     const auto can_interfaces = get_parameter("can_interfaces").as_string_array();
+//     const auto baud_rate = get_parameter("baud_rate").as_int();
 
-    if (can_interfaces.empty())
-    {
-        RCLCPP_ERROR(this->get_logger(), "[CAN Setup] 'can_interfaces' is empty");
-        return false;
-    }
+//     if (can_interfaces.empty())
+//     {
+//         RCLCPP_ERROR(this->get_logger(), "[CAN Setup] 'can_interfaces' is empty");
+//         return false;
+//     }
 
-    bool all_ok = true;
+//     bool all_ok = true;
 
-    for (const auto& can_name : can_interfaces)
-    {
-        RCLCPP_INFO(this->get_logger(),
-            "[CAN Setup] Setting up interface '%s' with bitrate %ld",
-            can_name.c_str(), baud_rate);
+//     for (const auto& can_name : can_interfaces)
+//     {
+//         RCLCPP_INFO(this->get_logger(),
+//             "[CAN Setup] Setting up interface '%s' with bitrate %ld",
+//             can_name.c_str(), baud_rate);
 
-        std::string result = execute_command("ip link show " + can_name + " 2>&1");
-        if (result.find("does not exist") != std::string::npos ||
-            result.find("Cannot find device") != std::string::npos)
-        {
-            RCLCPP_ERROR(this->get_logger(),
-                "[CAN Setup] Interface '%s' does not exist",
-                can_name.c_str());
-            all_ok = false;
-            continue;
-        }
+//         std::string result = execute_command("ip link show " + can_name + " 2>&1");
+//         if (result.find("does not exist") != std::string::npos ||
+//             result.find("Cannot find device") != std::string::npos)
+//         {
+//             RCLCPP_ERROR(this->get_logger(),
+//                 "[CAN Setup] Interface '%s' does not exist",
+//                 can_name.c_str());
+//             all_ok = false;
+//             continue;
+//         }
 
-        execute_command("sudo ip link set " + can_name + " down 2>&1");
-        execute_command("sudo ip link set " + can_name +" type can bitrate " + std::to_string(baud_rate) + " echo off 2>&1");
-        execute_command("sudo ip link set " + can_name + " up 2>&1");
-        execute_command("sleep 0.2");
-        execute_command("sudo ip link set " + can_name + " txqueuelen 4096 2>&1");
-        result = execute_command("ip -details link show " + can_name + " 2>&1");
+//         execute_command("sudo ip link set " + can_name + " down 2>&1");
+//         execute_command("sudo ip link set " + can_name +" type can bitrate " + std::to_string(baud_rate) + " echo off 2>&1");
+//         execute_command("sudo ip link set " + can_name + " up 2>&1");
+//         execute_command("sleep 0.2");
+//         execute_command("sudo ip link set " + can_name + " txqueuelen 4096 2>&1");
+//         result = execute_command("ip -details link show " + can_name + " 2>&1");
 
-        const bool is_up = (result.find("state UP") != std::string::npos);
-        const bool bitrate_ok =
-            (result.find("bitrate " + std::to_string(baud_rate)) != std::string::npos);
+//         const bool is_up = (result.find("state UP") != std::string::npos);
+//         const bool bitrate_ok =
+//             (result.find("bitrate " + std::to_string(baud_rate)) != std::string::npos);
 
-        if (is_up && bitrate_ok)
-        {
-            RCLCPP_INFO(this->get_logger(),
-                "[CAN Setup] '%s' activated successfully (bitrate=%ld)",
-                can_name.c_str(), baud_rate);
-        }
-        else
-        {
-            RCLCPP_ERROR(this->get_logger(),
-                "[CAN Setup] '%s' setup failed. Expected UP and bitrate=%ld",
-                can_name.c_str(), baud_rate);
-            RCLCPP_ERROR(this->get_logger(),
-                "[CAN Setup] Details:\n%s", result.c_str());
-            all_ok = false;
-        }
-    }
+//         if (is_up && bitrate_ok)
+//         {
+//             RCLCPP_INFO(this->get_logger(),
+//                 "[CAN Setup] '%s' activated successfully (bitrate=%ld)",
+//                 can_name.c_str(), baud_rate);
+//         }
+//         else
+//         {
+//             RCLCPP_ERROR(this->get_logger(),
+//                 "[CAN Setup] '%s' setup failed. Expected UP and bitrate=%ld",
+//                 can_name.c_str(), baud_rate);
+//             RCLCPP_ERROR(this->get_logger(),
+//                 "[CAN Setup] Details:\n%s", result.c_str());
+//             all_ok = false;
+//         }
+//     }
 
-    return all_ok;
-}
+//     return all_ok;
+// }
 
 void MainControlNode::resetRuntimeStates()
 {
@@ -341,9 +341,9 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
 
 void MainControlNode::control_loop()
 {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-    "[Loop] current_state=%s",
-    (current_state == ControlState::READ_PACKET ? "READ" : "WRITE"));
+    // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+    // "[Loop] current_state=%s",
+    // (current_state == ControlState::READ_PACKET ? "READ" : "WRITE"));
 
     static auto last_print_time = std::chrono::steady_clock::now();
     static int write_count = 0;
@@ -357,8 +357,8 @@ void MainControlNode::control_loop()
 
         if (elapsed.count() >= 1.0)
         {
-            const double hz = write_count / elapsed.count();
-            RCLCPP_INFO(this->get_logger(), "Motor Control Rate: %.2f Hz", hz);
+            // const double hz = write_count / elapsed.count();
+            // RCLCPP_INFO(this->get_logger(), "Motor Control Rate: %.2f Hz", hz);
             last_print_time = current_time;
             write_count = 0;
         }
@@ -545,14 +545,14 @@ void MainControlNode::handle_read_packet()
             msg.states[i].velocity = velocity;
             msg.states[i].current  = current;
 
-            RCLCPP_DEBUG(this->get_logger(),
-                "[Read] bus=%s packet_index=%zu motor_id=%u pos=%.3f vel=%.3f cur=%.3f",
-                packet_index_to_bus_[i].c_str(),
-                i,
-                msg.states[i].motor_id,
-                wrapped_pos,
-                velocity,
-                current);
+            // RCLCPP_DEBUG(this->get_logger(),
+            //     "[Read] bus=%s packet_index=%zu motor_id=%u pos=%.3f vel=%.3f cur=%.3f",
+            //     packet_index_to_bus_[i].c_str(),
+            //     i,
+            //     msg.states[i].motor_id,
+            //     wrapped_pos,
+            //     velocity,
+            //     current);
         }
         else
         {
@@ -572,13 +572,13 @@ void MainControlNode::handle_read_packet()
             }
             msg.states[i].current  = static_cast<float>(all_motors_[i]->getCurrent());
 
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[Read] bus=%s packet_index=%zu motor_id=%u update failed (success=%d fail=%d)",
-                packet_index_to_bus_[i].c_str(),
-                i,
-                msg.states[i].motor_id,
-                success_count,
-                fail_count);
+            // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            //     "[Read] bus=%s packet_index=%zu motor_id=%u update failed (success=%d fail=%d)",
+            //     packet_index_to_bus_[i].c_str(),
+            //     i,
+            //     msg.states[i].motor_id,
+            //     success_count,
+            //     fail_count);
         }
     }
 
@@ -591,10 +591,8 @@ void MainControlNode::handle_read_packet()
         stabilization_ = true;
     }
 
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "stabilzation_ : %s, cycle_fali_count : %d", stabilization_ ? "true" : "false", cycle_fail_count);
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "[Read] BEFORE_PUBLISH");
+    // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "stabilzation_ : %s, cycle_fali_count : %d", stabilization_ ? "true" : "false", cycle_fail_count);
     state_pub->publish(msg);
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "[Read] AFTER_PUBLISH");
     transition_to(ControlState::WRITE_PACKET);
 }
 
@@ -615,19 +613,32 @@ void MainControlNode::logWriteSummaryThrottle()
 
 void MainControlNode::handle_write_packet()
 {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-    "[Write] ENTER packet_initialized=%s walk_initialized=%s",
-    packet_initialized_ ? "true" : "false",
-    walk_initialized_ ? "true" : "false");
+    // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+    //     "[Write] ENTER packet_initialized=%s walk_initialized=%s",
+    //     packet_initialized_ ? "true" : "false",
+    //     walk_initialized_ ? "true" : "false");
+
     float alpha = 0.0f;
 
-    std::lock_guard<std::mutex> lock(command_mutex_);
+    roa_interfaces::msg::MotorCommandArray command_snapshot;
+    bool packet_initialized_snapshot = false;
 
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
 
-    if (!packet_initialized_)
+        packet_initialized_snapshot = packet_initialized_;
+
+        if (packet_initialized_snapshot)
+        {
+            command_snapshot = packet_commands_;
+        }
+    }
+
+    if (!packet_initialized_snapshot)
     {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
             "[Write] packet_commands_ not initialized yet");
+
         transition_to(ControlState::READ_PACKET);
         return;
     }
@@ -641,28 +652,28 @@ void MainControlNode::handle_write_packet()
             for (size_t i = 0; i < all_motors_.size(); ++i)
             {
                 start_positions_[i] = static_cast<float>(all_motors_[i]->getPosition());
-                RCLCPP_INFO(this->get_logger(), "[Init] Captured Motor %zu at position %.3f", i, start_positions_[i]);
+
+                // RCLCPP_INFO(this->get_logger(),
+                //     "[Init] Captured Motor %zu at position %.3f",
+                //     i,
+                //     start_positions_[i]);
             }
 
             start_positions_captured_ = true;
             init_tick_count_ = 0;
 
-            RCLCPP_INFO(this->get_logger(),
-                "[Init] Captured start positions for %zu motors",
-                all_motors_.size());
-
-            // transition_to(ControlState::READ_PACKET);
-            // return;
-
+            // RCLCPP_INFO(this->get_logger(),
+            //     "[Init] Captured start positions for %zu motors",
+            //     all_motors_.size());
         }
-
     }
-
     else if (!walk_initialized_)
     {
         ++init_tick_count_;
+
         alpha = static_cast<float>(init_tick_count_) /
                 static_cast<float>(INIT_TOTAL_TICKS);
+
         if (alpha > 1.0f)
         {
             alpha = 1.0f;
@@ -675,7 +686,7 @@ void MainControlNode::handle_write_packet()
 
         if (group.write_stats.cooldown && now < group.write_stats.cooldown_until)
         {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "[Write] bus=%s in cooldown",
                 group.interface_name.c_str());
             continue;
@@ -687,8 +698,18 @@ void MainControlNode::handle_write_packet()
         for (size_t local_idx = 0; local_idx < group.motors.size(); ++local_idx)
         {
             const size_t packet_index = group.global_packet_indices[local_idx];
+
+            if (packet_index >= command_snapshot.commands.size())
+            {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "[Write] packet_index=%zu out of command_snapshot size=%zu",
+                    packet_index,
+                    command_snapshot.commands.size());
+                continue;
+            }
+
             auto& motor = group.motors[local_idx];
-            auto& cmd = packet_commands_.commands[packet_index];
+            const auto& cmd = command_snapshot.commands[packet_index];
 
             float command_pos = wrapToPi(cmd.position);
 
@@ -698,25 +719,32 @@ void MainControlNode::handle_write_packet()
                 float diff = command_pos - wrapToPi(start_raw);
 
                 if (diff > static_cast<float>(M_PI))
+                {
                     diff -= 2.0f * static_cast<float>(M_PI);
+                }
+
                 if (diff < -static_cast<float>(M_PI))
+                {
                     diff += 2.0f * static_cast<float>(M_PI);
+                }
 
                 command_pos = start_raw + alpha * diff;
 
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
-                    "[Init] bus=%s packet_index=%zu motor_id=%u start=%.3f target=%.3f cmd=%.3f alpha=%.3f",
-                    group.interface_name.c_str(),
-                    packet_index,
-                    cmd.motor_id,
-                    start_positions_[packet_index],
-                    wrapToPi(cmd.position),
-                    command_pos,
-                    alpha);
+                // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+                //     "[Init] bus=%s packet_index=%zu motor_id=%u start=%.3f target=%.3f cmd=%.3f alpha=%.3f",
+                //     group.interface_name.c_str(),
+                //     packet_index,
+                //     cmd.motor_id,
+                //     start_positions_[packet_index],
+                //     wrapToPi(cmd.position),
+                //     command_pos,
+                //     alpha);
             }
             else
             {
-                const float raw_pos = static_cast<float>(all_motors_[packet_index]->getPosition());
+                const float raw_pos =
+                    static_cast<float>(all_motors_[packet_index]->getPosition());
+
                 command_pos = computeWrappedCommand(raw_pos, wrapToPi(cmd.position));
             }
 
@@ -748,15 +776,15 @@ void MainControlNode::handle_write_packet()
                 ++group.write_stats.enobufs_count;
                 ++group.write_stats.consecutive_enobufs;
 
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s motor_fail_streak=%u bus_enobufs_streak=%u",
-                    phase,
-                    group.interface_name.c_str(),
-                    cmd.motor_id,
-                    packet_index,
-                    toString(result),
-                    motor_write_stats_[packet_index].consecutive_failures,
-                    group.write_stats.consecutive_enobufs);
+                // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                //     "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s motor_fail_streak=%u bus_enobufs_streak=%u",
+                //     phase,
+                //     group.interface_name.c_str(),
+                //     cmd.motor_id,
+                //     packet_index,
+                //     toString(result),
+                //     motor_write_stats_[packet_index].consecutive_failures,
+                //     group.write_stats.consecutive_enobufs);
 
                 bus_blocked_this_cycle = true;
                 break;
@@ -776,7 +804,7 @@ void MainControlNode::handle_write_packet()
                 break;
             }
 
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s fail_streak=%u",
                 phase,
                 group.interface_name.c_str(),
@@ -803,8 +831,10 @@ void MainControlNode::handle_write_packet()
     if (!walk_initialized_ && alpha >= 1.0f)
     {
         walk_initialized_ = true;
+
         RCLCPP_INFO(this->get_logger(),
-            "[Init] Walk initialized after %d ticks", init_tick_count_);
+            "[Init] Walk initialized after %d ticks",
+            init_tick_count_);
     }
 
     logWriteSummaryThrottle();
@@ -826,7 +856,7 @@ void MainControlNode::walkCallback(const roa_interfaces::msg::MotorCommandArray:
         const auto it = motor_id_to_index_.find(cmd.motor_id);
         if (it == motor_id_to_index_.end())
         {
-            RCLCPP_WARN(this->get_logger(),
+            RCLCPP_ERROR(this->get_logger(),
                 "[Walk Callback] Unknown motor_id: %u", cmd.motor_id);
             continue;
         }
