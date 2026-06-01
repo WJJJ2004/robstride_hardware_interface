@@ -11,16 +11,22 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(roa_interfaces REQUIRED)
 
 add_library(${PROJECT_NAME}_lib
   src/CanTransport.cpp
   src/RobStrideProtocol.cpp
   src/RobStrideMotor.cpp
+  src/filter.cpp
 )
 
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+)
+
+ament_target_dependencies(${PROJECT_NAME}_lib
+  rclcpp
 )
 
 add_executable(hardware_interface_node
@@ -41,6 +47,7 @@ ament_target_dependencies(hardware_interface_node
   rclcpp_lifecycle
   lifecycle_msgs
   std_msgs
+  roa_interfaces
 )
 
 install(TARGETS
@@ -49,6 +56,11 @@ install(TARGETS
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/can_setup.sh
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY launch

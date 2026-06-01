@@ -41,7 +41,7 @@ public:
 private:
     std::shared_ptr<CanTransport> transport_;
     uint8_t motor_id_;
-    uint8_t master_id_ = 0xFF;
+    uint8_t master_id_ = 0xFD;
     ActuatorType type_;
     MotorLimits limits_;
 
@@ -53,11 +53,12 @@ private:
     float current_ = 0.0f;
 
     void loadLimits();
+    float getVelocityFeedbackScale() const;
 };
 
-struct CanBusGroup
-{
-    std::string interface_name;
-    std::shared_ptr<CanTransport> transport;
-    std::vector<std::shared_ptr<RobStrideMotor>> motors;
-};
+// struct CanBusGroup
+// {
+//     std::string interface_name;
+//     std::shared_ptr<CanTransport> transport;
+//     std::vector<std::shared_ptr<RobStrideMotor>> motors;
+// };

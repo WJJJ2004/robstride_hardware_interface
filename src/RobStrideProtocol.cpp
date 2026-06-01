@@ -78,15 +78,18 @@ std::tuple<float, float, float, float ,float> RobStrideProtocol::parseFeedback(
     uint16_t t_int = (data[4] << 8) | data[5];
     uint16_t temp_int = (data[6] << 8) | data[7];
 
-    float p = ((static_cast<float>(p_int) / 32767.0f) - 1.0f) * p_max;
-    float v = ((static_cast<float>(v_int) / 32767.0f) - 1.0f) * v_max;
+    float p = -((static_cast<float>(p_int) / 32767.0f) - 1.0f) * p_max;
+    float v = -((static_cast<float>(v_int) / 32767.0f) - 1.0f) * v_max;
     float t = ((static_cast<float>(t_int) / 32767.0f) - 1.0f) * t_max;
     float temp = static_cast<float>(temp_int) * 0.1f;
+    // float c = t / 1.09f;
+
+    float torque_nm = (static_cast<float>(t_int) / 65535.0f) * 72.0f - 36.0f;
+    float c = torque_nm / 1.09f;
+
 
     // Torque(Nm) = (RawData / 65535.0) * 72.0 - 36.0
     // Current(A) = Torque(Nm) / 1.09
-    float torque_nm = (static_cast<float>(t_int) / 65535.0f) * 72.0f - 36.0f;
-    float c = torque_nm / 1.09f;
 
     return {p, v, t, temp, c};
 }
