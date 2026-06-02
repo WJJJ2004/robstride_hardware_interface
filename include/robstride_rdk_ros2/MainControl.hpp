@@ -91,7 +91,7 @@ private:
 
     // NOTE: use can-setup.sh to set up CAN interfaces before running. This function is a placeholder if we want to do dynamic setup in the future.
     // bool canSetup(); 
-    void toCSV(float pos, float vel);
+    // void toCSV(float pos, float vel);
 
     std::string execute_command(const std::string& cmd);
 
@@ -107,6 +107,7 @@ private:
     float computeWrappedCommand(float current_raw_pos, float target_wrapped_pos) const;
     void resetRuntimeStates();
     void logWriteSummaryThrottle();
+    bool isStartPositionReady(std::string* reason);
 
     std::vector<CanBusGroup> can_groups_;
     std::vector<std::shared_ptr<RobStrideMotor>> all_motors_;
@@ -138,12 +139,19 @@ private:
     int init_tick_count_ = 0;
     static constexpr int INIT_TOTAL_TICKS = 100;
 
-    bool stabilization_ = false;
+    bool last_read_cycle_all_updated_ = false;
 
     std::unordered_map<uint16_t, size_t> motor_id_to_index_;
 
     roa_interfaces::msg::MotorCommandArray packet_commands_;
     bool packet_initialized_{false};
+
+    // ===== Init start position validation =====
+    static constexpr float INIT_Q_ABS_LIMIT =
+        4.0f * static_cast<float>(M_PI);
+
+    std::vector<bool> motor_feedback_seen_;
+    std::vector<float> last_valid_motor_pos_;
 };
 
 #endif // MAIN_CONTROL_HPP

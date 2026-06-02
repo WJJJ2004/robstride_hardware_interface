@@ -142,9 +142,12 @@ void MainControlNode::resetRuntimeStates()
     start_positions_captured_ = false;
     init_tick_count_ = 0;
     start_positions_.clear();
-    stabilization_ = false;
+    last_read_cycle_all_updated_ = false;
 
     packet_initialized_ = false;
+
+    motor_feedback_seen_.assign(all_motors_.size(), false);
+    last_valid_motor_pos_.assign(all_motors_.size(), 0.0f);
 
     for (auto& group : can_groups_)
     {
@@ -297,6 +300,8 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
 {
     RCLCPP_INFO(this->get_logger(), "[Activate] Activating...");
 
+    resetRuntimeStates();
+
     for (size_t i = 0; i < all_motors_.size(); ++i)
     {
         if (all_motors_[i]->enable())
@@ -314,9 +319,9 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
             return CallbackReturn::FAILURE;
         }
     }
-    walk_initialized_ = false;
-    start_positions_captured_ = false;
-    init_tick_count_ = 0;
+    // walk_initialized_ = false;
+    // start_positions_captured_ = false;
+    // init_tick_count_ = 0;
 
     velocity_filters_.clear();
     velocity_filters_.reserve(all_motors_.size());
@@ -373,6 +378,59 @@ void MainControlNode::control_loop()
             handle_read_packet();
             break;
     }
+}
+bool MainControlNode::isStartPositionReady(std::string* reason)
+{
+    if (all_motors_.empty())
+    {
+        if (reason) *reason = "all_motors_ is empty";
+        return false;
+    }
+
+    if (motor_feedback_seen_.size() != all_motors_.size() ||
+        last_valid_motor_pos_.size() != all_motors_.size())
+    {
+        if (reason) *reason = "init validation buffers size mismatch";
+        return false;
+    }
+
+    for (size_t i = 0; i < all_motors_.size(); ++i)
+    {
+        if (!motor_feedback_seen_[i])
+        {
+            if (reason)
+            {
+                *reason = "motor " + std::to_string(i) +
+                          " valid feedback not seen yet";
+            }
+            return false;
+        }
+
+        const float q = last_valid_motor_pos_[i];
+
+        if (!std::isfinite(q))
+        {
+            if (reason)
+            {
+                *reason = "motor " + std::to_string(i) +
+                          " q is not finite";
+            }
+            return false;
+        }
+
+        if (std::fabs(q) > INIT_Q_ABS_LIMIT)
+        {
+            if (reason)
+            {
+                *reason = "motor " + std::to_string(i) +
+                          " q out of range: " + std::to_string(q);
+            }
+            return false;
+        }
+    }
+
+    if (reason) *reason = "ready";
+    return true;
 }
 
 void MainControlNode::transition_to(ControlState new_state)
@@ -531,9 +589,31 @@ void MainControlNode::handle_read_packet()
             ++success_count;
             ++cycle_success_count;
 
-            const float wrapped_pos = wrapToPi(static_cast<float>(all_motors_[i]->getPosition()));
+            const float raw_pos = static_cast<float>(all_motors_[i]->getPosition());
+            const float wrapped_pos = wrapToPi(raw_pos);
             const float raw_velocity = static_cast<float>(all_motors_[i]->getVelocity());
             const float current  = static_cast<float>(all_motors_[i]->getCurrent());
+
+            // ===== Init last valid q update =====
+            if (std::isfinite(raw_pos) && std::fabs(raw_pos) <= INIT_Q_ABS_LIMIT)
+            {
+                if (i < motor_feedback_seen_.size())
+                {
+                    motor_feedback_seen_[i] = true;
+                }
+
+                if (i < last_valid_motor_pos_.size())
+                {
+                    last_valid_motor_pos_[i] = raw_pos;
+                }
+            }
+            else
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "[InitValidation] Invalid q feedback ignored. motor_index=%zu raw_pos=%.6f",
+                    i,
+                    raw_pos);
+            }
 
             float velocity = raw_velocity;
             if (i < velocity_filters_.size())
@@ -544,15 +624,6 @@ void MainControlNode::handle_read_packet()
             msg.states[i].position = wrapped_pos;
             msg.states[i].velocity = velocity;
             msg.states[i].current  = current;
-
-            // RCLCPP_DEBUG(this->get_logger(),
-            //     "[Read] bus=%s packet_index=%zu motor_id=%u pos=%.3f vel=%.3f cur=%.3f",
-            //     packet_index_to_bus_[i].c_str(),
-            //     i,
-            //     msg.states[i].motor_id,
-            //     wrapped_pos,
-            //     velocity,
-            //     current);
         }
         else
         {
@@ -584,14 +655,14 @@ void MainControlNode::handle_read_packet()
 
     if(cycle_fail_count != 0)
     {
-        stabilization_ = false;
+        last_read_cycle_all_updated_ = false;
     }
     else
     {
-        stabilization_ = true;
+        last_read_cycle_all_updated_ = true;
     }
 
-    // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "stabilzation_ : %s, cycle_fali_count : %d", stabilization_ ? "true" : "false", cycle_fail_count);
+    // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "stabilzation_ : %s, cycle_fali_count : %d", last_read_cycle_all_updated_ ? "true" : "false", cycle_fail_count);
     state_pub->publish(msg);
     transition_to(ControlState::WRITE_PACKET);
 }
@@ -600,7 +671,7 @@ void MainControlNode::logWriteSummaryThrottle()
 {
     for (const auto& group : can_groups_)
     {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
             "[WriteSummary] bus=%s ok=%u fail=%u enobufs_total=%u enobufs_streak=%u cooldown=%s",
             group.interface_name.c_str(),
             group.write_stats.ok_writes,
@@ -645,27 +716,55 @@ void MainControlNode::handle_write_packet()
 
     if (!walk_initialized_ && !start_positions_captured_)
     {
-        if (!stabilization_)
+        std::string reason;
+
+        if (!isStartPositionReady(&reason))
         {
-            start_positions_.resize(all_motors_.size(), 0.0f);
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[Init] Waiting for valid start position. reason=%s",
+                reason.c_str());
 
-            for (size_t i = 0; i < all_motors_.size(); ++i)
+            transition_to(ControlState::READ_PACKET);
+            return;
+        }
+
+        start_positions_.assign(all_motors_.size(), 0.0f);
+
+        for (size_t i = 0; i < all_motors_.size(); ++i)
+        {
+            const float pos = last_valid_motor_pos_[i];
+
+            if (!std::isfinite(pos) || std::fabs(pos) > INIT_Q_ABS_LIMIT)
             {
-                start_positions_[i] = static_cast<float>(all_motors_[i]->getPosition());
+                RCLCPP_ERROR(this->get_logger(),
+                    "[Init] Final capture rejected. motor=%zu pos=%.6f",
+                    i,
+                    pos);
 
-                // RCLCPP_INFO(this->get_logger(),
-                //     "[Init] Captured Motor %zu at position %.3f",
-                //     i,
-                //     start_positions_[i]);
+                start_positions_.clear();
+                start_positions_captured_ = false;
+
+                transition_to(ControlState::READ_PACKET);
+                return;
             }
 
-            start_positions_captured_ = true;
-            init_tick_count_ = 0;
+            start_positions_[i] = pos;
 
-            // RCLCPP_INFO(this->get_logger(),
-            //     "[Init] Captured start positions for %zu motors",
-            //     all_motors_.size());
+            RCLCPP_INFO(this->get_logger(),
+                "[Init] Captured Motor %zu at position %.6f",
+                i,
+                start_positions_[i]);
         }
+
+        start_positions_captured_ = true;
+        init_tick_count_ = 0;
+
+        RCLCPP_INFO(this->get_logger(),
+            "[Init] Captured validated start positions for %zu motors",
+            all_motors_.size());
+
+        transition_to(ControlState::READ_PACKET);
+        return;
     }
     else if (!walk_initialized_)
     {
@@ -864,16 +963,16 @@ void MainControlNode::walkCallback(const roa_interfaces::msg::MotorCommandArray:
         const size_t packet_index = it->second;
         packet_commands_.commands[packet_index] = cmd;
 
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "[Walk Callback] bus=%s motor_id=%u -> packet_index=%zu | pos=%.3f vel=%.3f kp=%.3f kd=%.3f tq=%.3f",
-            packet_index_to_bus_[packet_index].c_str(),
-            cmd.motor_id,
-            packet_index,
-            cmd.position,
-            cmd.velocity,
-            cmd.kp,
-            cmd.kd,
-            cmd.torque);
+        // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        //     "[Walk Callback] bus=%s motor_id=%u -> packet_index=%zu | pos=%.3f vel=%.3f kp=%.3f kd=%.3f tq=%.3f",
+        //     packet_index_to_bus_[packet_index].c_str(),
+        //     cmd.motor_id,
+        //     packet_index,
+        //     cmd.position,
+        //     cmd.velocity,
+        //     cmd.kp,
+        //     cmd.kd,
+        //     cmd.torque);
     }
 
     if (!packet_initialized_)
@@ -929,58 +1028,58 @@ void MainControlNode::torqueCallback(const std_msgs::msg::Bool::SharedPtr msg)
     }
 }
 
-void MainControlNode::toCSV(float pos, float vel)
-{
-  static std::ofstream csv_file("motor_data.csv");
+// void MainControlNode::toCSV(float pos, float vel)
+// {
+//   static std::ofstream csv_file("motor_data.csv");
 
-  if(!csv_file.is_open())
-  {
-    std::cerr << "Failed to open CSV file for writing!" << std::endl;
-    return;
-  }
+//   if(!csv_file.is_open())
+//   {
+//     std::cerr << "Failed to open CSV file for writing!" << std::endl;
+//     return;
+//   }
 
-  csv_file << "Timestamp(ms),Position(rad),Velocity(rad/s)" << std::endl;
+//   csv_file << "Timestamp(ms),Position(rad),Velocity(rad/s)" << std::endl;
 
-  static bool initialized = false;
+//   static bool initialized = false;
 
-  if (!initialized)
-  {
-    pos = 0.0f;
-    vel = 0.0f;
+//   if (!initialized)
+//   {
+//     pos = 0.0f;
+//     vel = 0.0f;
 
-    initialized = true;
-  }
+//     initialized = true;
+//   }
 
-  static int timestamp = 0;
+//   static int timestamp = 0;
 
-  csv_file << std::fixed << std::setprecision(5);
-  csv_file << timestamp << "," << pos << "," << vel << "\n";
+//   csv_file << std::fixed << std::setprecision(5);
+//   csv_file << timestamp << "," << pos << "," << vel << "\n";
 
-  std::cout << "Converting data to CSV..." << std::endl;
+//   std::cout << "Converting data to CSV..." << std::endl;
 
-  if(timestamp >= 10000) // 10초 동안 데이터 기록 후 종료
-  {
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
-    std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//   if(timestamp >= 10000) // 10초 동안 데이터 기록 후 종료
+//   {
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
+//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
 
-    csv_file.close();
-  }
-  else
-  {
-    timestamp += 2;
-  }
+//     csv_file.close();
+//   }
+//   else
+//   {
+//     timestamp += 2;
+//   }
 
-}
+// }
 
 // 메인 함수
 int main(int argc, char **argv) {
