@@ -1,21 +1,21 @@
-hardware_interface_node:
-  ros__parameters:
-    can_interfaces: ["can0"]
-    baud_rate: 1000000
-
-    can0:
-      motor_ids: [2, 12]
-      motor_type: [06, 03]
-
 # hardware_interface_node:
 #   ros__parameters:
-#     can_interfaces: ["can_right_leg", "can_left_leg"]
+#     can_interfaces: ["can0"]
 #     baud_rate: 1000000
 
-#     can_right_leg:
-#       motor_ids: [9, 11, 13, 15, 17, 19, 21]
-#       motor_type: [06, 04, 03, 03, 04, 06, 06]
+#     can0:
+#       motor_ids: [2, 12]
+#       motor_type: [06, 03]
 
-#     can_left_leg:
-#       motor_ids: [10, 12, 14, 16, 18, 20]
-#       motor_type: [04, 03, 03, 04, 06, 06]
+hardware_interface_node:
+  ros__parameters:
+    can_interfaces: ["can_right_leg", "can_left_leg"]
+    baud_rate: 1000000
+
+    can_right_leg:
+      motor_ids: [9, 11, 13, 15, 17, 19, 21]
+      motor_type: [06, 04, 03, 03, 04, 06, 06]
+
+    can_left_leg:
+      motor_ids: [10, 12, 14, 16, 18, 20]
+      motor_type: [04, 03, 03, 04, 06, 06]

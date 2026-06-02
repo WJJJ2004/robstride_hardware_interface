@@ -145,6 +145,7 @@ void MainControlNode::resetRuntimeStates()
     last_read_cycle_all_updated_ = false;
 
     packet_initialized_ = false;
+    initial_raw_position_printed_ = false;
 
     motor_feedback_seen_.assign(all_motors_.size(), false);
     last_valid_motor_pos_.assign(all_motors_.size(), 0.0f);
@@ -494,6 +495,55 @@ WriteResult MainControlNode::safeSendCommand(
     }
 }
 
+void MainControlNode::printInitialRawPositionsOnce(const char* tag)
+{
+    if (initial_raw_position_printed_)
+    {
+        return;
+    }
+
+    initial_raw_position_printed_ = true;
+
+    RCLCPP_WARN(this->get_logger(),
+        "==================== [Initial Raw Position Debug: %s] ====================",
+        tag);
+
+    for (size_t i = 0; i < all_motors_.size(); ++i)
+    {
+        const float raw_q = static_cast<float>(all_motors_[i]->getPosition());
+        const float wrapped_q = wrapToPi(raw_q);
+        const float turns = raw_q / (2.0f * static_cast<float>(M_PI));
+
+        const bool seen =
+            (i < motor_feedback_seen_.size()) ? motor_feedback_seen_[i] : false;
+
+        const float last_valid_q =
+            (i < last_valid_motor_pos_.size()) ? last_valid_motor_pos_[i] : 0.0f;
+
+        const float last_valid_wrapped = wrapToPi(last_valid_q);
+        const float last_valid_turns =
+            last_valid_q / (2.0f * static_cast<float>(M_PI));
+
+        RCLCPP_WARN(this->get_logger(),
+            "[InitialRawQ] packet_index=%zu motor_id=%u bus=%s seen=%s "
+            "raw_q=%.6f wrapped_q=%.6f turns=%.3f "
+            "last_valid_q=%.6f last_valid_wrapped=%.6f last_valid_turns=%.3f",
+            i,
+            all_motors_[i]->getMotorId(),
+            (i < packet_index_to_bus_.size() ? packet_index_to_bus_[i].c_str() : "unknown"),
+            seen ? "true" : "false",
+            raw_q,
+            wrapped_q,
+            turns,
+            last_valid_q,
+            last_valid_wrapped,
+            last_valid_turns);
+    }
+
+    RCLCPP_WARN(this->get_logger(),
+        "==========================================================================");
+}
+
 void MainControlNode::handle_read_packet()
 {
     static int fail_count = 0;
@@ -717,18 +767,20 @@ void MainControlNode::handle_write_packet()
     if (!walk_initialized_ && !start_positions_captured_)
     {
         std::string reason;
-
         if (!isStartPositionReady(&reason))
         {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            RCLCPP_ERROR(this->get_logger(),
                 "[Init] Waiting for valid start position. reason=%s",
                 reason.c_str());
 
             transition_to(ControlState::READ_PACKET);
             return;
         }
-
+        printInitialRawPositionsOnce("before_start_capture");
         start_positions_.assign(all_motors_.size(), 0.0f);
+
+        // // todo 추후 삭제 
+        // return;
 
         for (size_t i = 0; i < all_motors_.size(); ++i)
         {
@@ -846,7 +898,7 @@ void MainControlNode::handle_write_packet()
 
                 command_pos = computeWrappedCommand(raw_pos, wrapToPi(cmd.position));
             }
-
+         
             const WriteResult result = safeSendCommand(
                 *motor,
                 cmd.torque,

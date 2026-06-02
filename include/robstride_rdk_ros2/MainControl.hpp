@@ -152,6 +152,10 @@ private:
 
     std::vector<bool> motor_feedback_seen_;
     std::vector<float> last_valid_motor_pos_;
+
+    // For debugging
+    void printInitialRawPositionsOnce(const char* tag);
+    bool initial_raw_position_printed_ = false;
 };
 
 #endif // MAIN_CONTROL_HPP
