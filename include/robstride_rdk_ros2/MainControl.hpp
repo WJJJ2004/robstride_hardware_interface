@@ -80,6 +80,7 @@ public:
     on_activate(const rclcpp_lifecycle::State &);
 
 private:
+    void flushCanRxQueues(const char* tag);
     void control_loop();
     void walkCallback(const roa_interfaces::msg::MotorCommandArray::SharedPtr msg);
     void torqueCallback(const std_msgs::msg::Bool::SharedPtr msg);
@@ -138,7 +139,7 @@ private:
     std::vector<float> start_positions_;
     int init_tick_count_ = 0;
     static constexpr int INIT_TOTAL_TICKS = 100;
-
+    bool start_position_init_attempted_ = false;
     bool last_read_cycle_all_updated_ = false;
 
     std::unordered_map<uint16_t, size_t> motor_id_to_index_;

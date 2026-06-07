@@ -28,6 +28,20 @@ MainControlNode::MainControlNode(const rclcpp::NodeOptions & options)
 
 MainControlNode::~MainControlNode()
 {
+    RCLCPP_INFO(this->get_logger(), "MainControlNode destroying...");
+
+    timer_.reset();
+
+    for (size_t i = 0; i < all_motors_.size(); ++i)
+    {
+        if (all_motors_[i])
+        {
+            all_motors_[i]->disable();
+        }
+    }
+
+    flushCanRxQueues("destructor");
+
     RCLCPP_INFO(this->get_logger(), "MainControlNode destroyed");
 }
 
@@ -75,71 +89,12 @@ std::string MainControlNode::execute_command(const std::string& cmd)
     return result;
 }
 
-// bool MainControlNode::canSetup()
-// {
-//     const auto can_interfaces = get_parameter("can_interfaces").as_string_array();
-//     const auto baud_rate = get_parameter("baud_rate").as_int();
-
-//     if (can_interfaces.empty())
-//     {
-//         RCLCPP_ERROR(this->get_logger(), "[CAN Setup] 'can_interfaces' is empty");
-//         return false;
-//     }
-
-//     bool all_ok = true;
-
-//     for (const auto& can_name : can_interfaces)
-//     {
-//         RCLCPP_INFO(this->get_logger(),
-//             "[CAN Setup] Setting up interface '%s' with bitrate %ld",
-//             can_name.c_str(), baud_rate);
-
-//         std::string result = execute_command("ip link show " + can_name + " 2>&1");
-//         if (result.find("does not exist") != std::string::npos ||
-//             result.find("Cannot find device") != std::string::npos)
-//         {
-//             RCLCPP_ERROR(this->get_logger(),
-//                 "[CAN Setup] Interface '%s' does not exist",
-//                 can_name.c_str());
-//             all_ok = false;
-//             continue;
-//         }
-
-//         execute_command("sudo ip link set " + can_name + " down 2>&1");
-//         execute_command("sudo ip link set " + can_name +" type can bitrate " + std::to_string(baud_rate) + " echo off 2>&1");
-//         execute_command("sudo ip link set " + can_name + " up 2>&1");
-//         execute_command("sleep 0.2");
-//         execute_command("sudo ip link set " + can_name + " txqueuelen 4096 2>&1");
-//         result = execute_command("ip -details link show " + can_name + " 2>&1");
-
-//         const bool is_up = (result.find("state UP") != std::string::npos);
-//         const bool bitrate_ok =
-//             (result.find("bitrate " + std::to_string(baud_rate)) != std::string::npos);
-
-//         if (is_up && bitrate_ok)
-//         {
-//             RCLCPP_INFO(this->get_logger(),
-//                 "[CAN Setup] '%s' activated successfully (bitrate=%ld)",
-//                 can_name.c_str(), baud_rate);
-//         }
-//         else
-//         {
-//             RCLCPP_ERROR(this->get_logger(),
-//                 "[CAN Setup] '%s' setup failed. Expected UP and bitrate=%ld",
-//                 can_name.c_str(), baud_rate);
-//             RCLCPP_ERROR(this->get_logger(),
-//                 "[CAN Setup] Details:\n%s", result.c_str());
-//             all_ok = false;
-//         }
-//     }
-
-//     return all_ok;
-// }
-
 void MainControlNode::resetRuntimeStates()
 {
     walk_initialized_ = false;
     start_positions_captured_ = false;
+    start_position_init_attempted_ = false;
+
     init_tick_count_ = 0;
     start_positions_.clear();
     last_read_cycle_all_updated_ = false;
@@ -302,6 +257,7 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
     RCLCPP_INFO(this->get_logger(), "[Activate] Activating...");
 
     resetRuntimeStates();
+    flushCanRxQueues("before_enable");
 
     for (size_t i = 0; i < all_motors_.size(); ++i)
     {
@@ -317,9 +273,13 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
                 i,
                 (i < packet_index_to_bus_.size() ? packet_index_to_bus_[i].c_str() : "unknown"),
                 all_motors_[i]->getMotorId());
+            RCLCPP_ERROR(this->get_logger(),
+                "[Activate] Aborting activation due to motor enable failure - HINT: check CAN connections and motor IDs");
             return CallbackReturn::FAILURE;
         }
     }
+    flushCanRxQueues("after_enable");
+
     // walk_initialized_ = false;
     // start_positions_captured_ = false;
     // init_tick_count_ = 0;
@@ -758,7 +718,7 @@ void MainControlNode::handle_write_packet()
     if (!packet_initialized_snapshot)
     {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "[Write] packet_commands_ not initialized yet");
+            "[Write] No command received yet, skipping write. HINT: check if the command publisher is active and publishing to /hardware_interface/command");
 
         transition_to(ControlState::READ_PACKET);
         return;
@@ -769,14 +729,13 @@ void MainControlNode::handle_write_packet()
         std::string reason;
         if (!isStartPositionReady(&reason))
         {
-            RCLCPP_ERROR(this->get_logger(),
-                "[Init] Waiting for valid start position. reason=%s",
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[Init] Aborting initialization-write due to invalid start position reason=%s",
                 reason.c_str());
-
             transition_to(ControlState::READ_PACKET);
             return;
         }
-        printInitialRawPositionsOnce("before_start_capture");
+        // printInitialRawPositionsOnce("before_start_capture");
         start_positions_.assign(all_motors_.size(), 0.0f);
 
         // // todo 추후 삭제 
@@ -984,7 +943,7 @@ void MainControlNode::handle_write_packet()
         walk_initialized_ = true;
 
         RCLCPP_INFO(this->get_logger(),
-            "[Init] Walk initialized after %d ticks",
+            "[Init] initialization interpolation completed after %d ticks",
             init_tick_count_);
     }
 
@@ -1008,7 +967,7 @@ void MainControlNode::walkCallback(const roa_interfaces::msg::MotorCommandArray:
         if (it == motor_id_to_index_.end())
         {
             RCLCPP_ERROR(this->get_logger(),
-                "[Walk Callback] Unknown motor_id: %u", cmd.motor_id);
+                "[ros_sub] Unknown motor_id: %u", cmd.motor_id);
             continue;
         }
 
@@ -1029,7 +988,7 @@ void MainControlNode::walkCallback(const roa_interfaces::msg::MotorCommandArray:
 
     if (!packet_initialized_)
     {
-        RCLCPP_INFO(this->get_logger(), "[Walk Callback] First valid command received");
+        RCLCPP_INFO(this->get_logger(), "[ros_sub] First valid command received");
     }
 
     packet_initialized_ = true;
@@ -1080,58 +1039,28 @@ void MainControlNode::torqueCallback(const std_msgs::msg::Bool::SharedPtr msg)
     }
 }
 
-// void MainControlNode::toCSV(float pos, float vel)
-// {
-//   static std::ofstream csv_file("motor_data.csv");
+// 디버그용: CAN 수신 큐 플러시
+void MainControlNode::flushCanRxQueues(const char* tag)
+{
+    uint32_t rx_id = 0;
+    std::vector<uint8_t> rx_data;
 
-//   if(!csv_file.is_open())
-//   {
-//     std::cerr << "Failed to open CSV file for writing!" << std::endl;
-//     return;
-//   }
+    for (auto& group : can_groups_)
+    {
+        int flushed = 0;
 
-//   csv_file << "Timestamp(ms),Position(rad),Velocity(rad/s)" << std::endl;
+        while (group.transport && group.transport->receive(rx_id, rx_data, 0))
+        {
+            flushed++;
+        }
 
-//   static bool initialized = false;
-
-//   if (!initialized)
-//   {
-//     pos = 0.0f;
-//     vel = 0.0f;
-
-//     initialized = true;
-//   }
-
-//   static int timestamp = 0;
-
-//   csv_file << std::fixed << std::setprecision(5);
-//   csv_file << timestamp << "," << pos << "," << vel << "\n";
-
-//   std::cout << "Converting data to CSV..." << std::endl;
-
-//   if(timestamp >= 10000) // 10초 동안 데이터 기록 후 종료
-//   {
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-//     std::cout << "Finished writing to CSV. Closing file." << std::endl;
-
-//     csv_file.close();
-//   }
-//   else
-//   {
-//     timestamp += 2;
-//   }
-
-// }
+        RCLCPP_WARN(this->get_logger(),
+            "[CAN Flush:%s] bus=%s flushed %d pending RX frames",
+            tag,
+            group.interface_name.c_str(),
+            flushed);
+    }
+}
 
 // 메인 함수
 int main(int argc, char **argv) {
