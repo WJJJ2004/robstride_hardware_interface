@@ -489,9 +489,13 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
 
         if (!group.transport->open(can_name))
         {
-            RCLCPP_ERROR(this->get_logger(),
-                "[Configure] Failed to open CAN interface '%s'",
-                can_name.c_str());
+            requestFatalShutdown(
+                "[Configure] Failed to open CAN interface '" +
+                can_name + "'"
+            );
+            // RCLCPP_ERROR(this->get_logger(),
+            //     "[Configure] Failed to open CAN interface '%s'",
+            //     can_name.c_str());
             return CallbackReturn::FAILURE;
         }
 
@@ -500,9 +504,13 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
 
         if (motor_ids.size() != motor_types.size())
         {
-            RCLCPP_ERROR(this->get_logger(),
-                "[Configure] %s: motor_ids and motor_type size mismatch",
-                can_name.c_str());
+            requestFatalShutdown(
+                "[Configure] %s: motor_ids and motor_type size mismatch" +
+                can_name + "'"
+            );
+            // RCLCPP_ERROR(this->get_logger(),
+            //     "[Configure] %s: motor_ids and motor_type size mismatch",
+            //     can_name.c_str());
             return CallbackReturn::FAILURE;
         }
 
@@ -533,8 +541,11 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
 
         if (motor_id_to_index_.find(id) != motor_id_to_index_.end())
         {
-            RCLCPP_ERROR(this->get_logger(),
-                "[Configure] Duplicate motor_id detected: %u", id);
+            requestFatalShutdown(
+                "[Configure] Duplicate motor_id detected: " +
+                std::to_string(id));
+            // RCLCPP_ERROR(this->get_logger(),
+            //     "[Configure] Duplicate motor_id detected: %u", id);
             return CallbackReturn::FAILURE;
         }
 
@@ -597,8 +608,12 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
                     : "unknown",
                 static_cast<unsigned>(
                     all_motors_[i]->getMotorId()));
-
-            disableAllMotors();
+            // disableAllMotors();
+            requestFatalShutdown(
+                "[Activate] Enable command TX failed: "
+                "packet_index=" + std::to_string(i) +
+                " bus=" + (i < packet_index_to_bus_.size() ? packet_index_to_bus_[i] : "unknown") +
+                " motor_id=" + std::to_string(all_motors_[i]->getMotorId()));
 
             return CallbackReturn::FAILURE;
         }
@@ -636,6 +651,9 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
 
         flushCanRxQueues(
             "activate_failure_after_disable");
+        requestFatalShutdown(
+            "[Activate] Motor activation verification failed. "
+            "Control loop will not start.");
 
         return CallbackReturn::FAILURE;
     }
@@ -1443,6 +1461,27 @@ void MainControlNode::flushCanRxQueues(const char* tag)
             tag,
             group.interface_name.c_str(),
             flushed);
+    }
+}
+
+void MainControlNode::requestFatalShutdown(
+    const std::string& reason)
+{
+    RCLCPP_FATAL(
+        this->get_logger(),
+        "[FatalShutdown] %s",
+        reason.c_str());
+
+    // 제어 루프가 이미 실행 중인 경우 중지
+    timer_.reset();
+
+    // 생성된 모터가 있다면 가능한 범위에서 Disable
+    disableAllMotors();
+
+    // executor의 spin()을 종료시킴
+    if (rclcpp::ok())
+    {
+        rclcpp::shutdown();
     }
 }
 

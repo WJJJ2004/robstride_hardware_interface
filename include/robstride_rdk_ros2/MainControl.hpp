@@ -172,6 +172,7 @@ private:
         uint32_t rx_id,
         const std::vector<uint8_t>& rx_data,
         const char* phase);
+    void requestFatalShutdown(const std::string& reason);
 };
 
 #endif // MAIN_CONTROL_HPP
