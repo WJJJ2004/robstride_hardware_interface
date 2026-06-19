@@ -28,7 +28,7 @@ public:
     bool disable();
 
     bool sendMotionCommand(float torque, float position, float velocity, float kp, float kd);
-    bool processPacket(uint32_t rx_id, const std::vector<uint8_t>& rx_data);
+    void processPacket(uint32_t rx_id, const std::vector<uint8_t>& rx_data);
 
     // Getters
     uint8_t getMotorId() const { return motor_id_; }

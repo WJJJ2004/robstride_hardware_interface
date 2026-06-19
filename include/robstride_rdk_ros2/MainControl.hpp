@@ -157,6 +157,18 @@ private:
     // For debugging
     void printInitialRawPositionsOnce(const char* tag);
     bool initial_raw_position_printed_ = false;
+
+    // for initial feedback verification
+    bool verifyInitialMotorFeedback(
+    std::chrono::milliseconds timeout);
+
+    void disableAllMotors();
+
+    bool processReceivedFrame(
+        CanBusGroup& group,
+        uint32_t rx_id,
+        const std::vector<uint8_t>& rx_data,
+        const char* phase);
 };
 
 #endif // MAIN_CONTROL_HPP

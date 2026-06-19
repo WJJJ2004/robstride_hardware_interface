@@ -89,6 +89,325 @@ std::string MainControlNode::execute_command(const std::string& cmd)
     return result;
 }
 
+// ------------------------------- Motor Feedback Handling For Initial -------------------------------
+
+bool MainControlNode::processReceivedFrame(
+    CanBusGroup& group,
+    uint32_t rx_id,
+    const std::vector<uint8_t>& rx_data,
+    const char* phase)
+{
+    const uint8_t motor_id =
+        RobStrideProtocol::getMotorIdFromCanId(rx_id);
+
+    const uint8_t type =
+        RobStrideProtocol::getTypeFromCanId(rx_id);
+
+    for (size_t local_idx = 0;
+         local_idx < group.motors.size();
+         ++local_idx)
+    {
+        auto& motor = group.motors[local_idx];
+
+        if (motor->getMotorId() != motor_id)
+        {
+            continue;
+        }
+
+        if (local_idx >= group.global_packet_indices.size())
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "[%s] Invalid local index mapping: "
+                "bus=%s local_idx=%zu",
+                phase,
+                group.interface_name.c_str(),
+                local_idx);
+
+            return false;
+        }
+
+        const size_t packet_index =
+            group.global_packet_indices[local_idx];
+
+        if (packet_index >= all_motors_.size() ||
+            packet_index >= motor_feedback_seen_.size() ||
+            packet_index >= last_valid_motor_pos_.size())
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "[%s] Invalid global packet index: "
+                "bus=%s packet_index=%zu",
+                phase,
+                group.interface_name.c_str(),
+                packet_index);
+
+            return false;
+        }
+
+        if (!motor->processPacket(rx_id, rx_data))
+        {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[%s] Unsupported or invalid motor frame: "
+                "bus=%s motor_id=%u type=%u "
+                "can_id=0x%08X size=%zu",
+                phase,
+                group.interface_name.c_str(),
+                static_cast<unsigned>(motor_id),
+                static_cast<unsigned>(type),
+                rx_id,
+                rx_data.size());
+
+            return false;
+        }
+
+        const float q =
+            static_cast<float>(motor->getPosition());
+
+        const float qdot =
+            static_cast<float>(motor->getVelocity());
+
+        const float current =
+            static_cast<float>(motor->getCurrent());
+
+        if (!std::isfinite(q) ||
+            !std::isfinite(qdot) ||
+            !std::isfinite(current))
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "[%s] Non-finite motor feedback: "
+                "bus=%s motor_id=%u "
+                "q=%.6f qdot=%.6f current=%.6f",
+                phase,
+                group.interface_name.c_str(),
+                static_cast<unsigned>(motor_id),
+                q,
+                qdot,
+                current);
+
+            return false;
+        }
+
+        if (std::fabs(q) > INIT_Q_ABS_LIMIT)
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "[%s] Position out of range: "
+                "bus=%s motor_id=%u q=%.6f limit=%.6f",
+                phase,
+                group.interface_name.c_str(),
+                static_cast<unsigned>(motor_id),
+                q,
+                INIT_Q_ABS_LIMIT);
+
+            return false;
+        }
+
+        const bool first_feedback =
+            !motor_feedback_seen_[packet_index];
+
+        motor_feedback_seen_[packet_index] = true;
+        last_valid_motor_pos_[packet_index] = q;
+
+        if (first_feedback)
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[%s] Motor feedback confirmed: "
+                "bus=%s motor_id=%u packet_index=%zu "
+                "q=%.6f qdot=%.6f current=%.6f",
+                phase,
+                group.interface_name.c_str(),
+                static_cast<unsigned>(motor_id),
+                packet_index,
+                q,
+                qdot,
+                current);
+        }
+
+        return true;
+    }
+
+    RCLCPP_WARN(
+        this->get_logger(),
+        "[%s] Frame from unknown motor: "
+        "bus=%s motor_id=%u type=%u can_id=0x%08X",
+        phase,
+        group.interface_name.c_str(),
+        static_cast<unsigned>(motor_id),
+        static_cast<unsigned>(type),
+        rx_id);
+
+    return false;
+}
+
+bool MainControlNode::verifyInitialMotorFeedback(
+    std::chrono::milliseconds timeout)
+{
+    if (all_motors_.empty())
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "[ActivateVerify] No motors configured");
+
+        return false;
+    }
+
+    if (motor_feedback_seen_.size() != all_motors_.size() ||
+        last_valid_motor_pos_.size() != all_motors_.size())
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "[ActivateVerify] Validation buffer size mismatch: "
+            "motors=%zu seen=%zu positions=%zu",
+            all_motors_.size(),
+            motor_feedback_seen_.size(),
+            last_valid_motor_pos_.size());
+
+        return false;
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + timeout;
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        bool received_any_frame = false;
+
+        for (auto& group : can_groups_)
+        {
+            if (!group.transport ||
+                !group.transport->isOpen())
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[ActivateVerify] CAN transport unavailable: "
+                    "bus=%s",
+                    group.interface_name.c_str());
+
+                return false;
+            }
+
+            uint32_t rx_id = 0;
+            std::vector<uint8_t> rx_data;
+
+            constexpr int MAX_FRAMES_PER_BUS_PER_PASS = 100;
+            int received_count = 0;
+
+            while (received_count <
+                       MAX_FRAMES_PER_BUS_PER_PASS &&
+                   group.transport->receive(
+                       rx_id,
+                       rx_data,
+                       0))
+            {
+                ++received_count;
+                received_any_frame = true;
+
+                processReceivedFrame(
+                    group,
+                    rx_id,
+                    rx_data,
+                    "ActivateVerify");
+            }
+        }
+
+        bool all_confirmed = true;
+
+        for (size_t i = 0;
+             i < motor_feedback_seen_.size();
+             ++i)
+        {
+            if (!motor_feedback_seen_[i])
+            {
+                all_confirmed = false;
+                break;
+            }
+        }
+
+        if (all_confirmed)
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[ActivateVerify] All %zu motors "
+                "provided valid feedback",
+                all_motors_.size());
+
+            return true;
+        }
+
+        if (!received_any_frame)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1));
+        }
+    }
+
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "[ActivateVerify] Feedback verification timeout: "
+        "%ld ms",
+        static_cast<long>(timeout.count()));
+
+    for (size_t i = 0;
+         i < all_motors_.size();
+         ++i)
+    {
+        if (motor_feedback_seen_[i])
+        {
+            continue;
+        }
+
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "[ActivateVerify] Missing feedback: "
+            "packet_index=%zu bus=%s motor_id=%u",
+            i,
+            i < packet_index_to_bus_.size()
+                ? packet_index_to_bus_[i].c_str()
+                : "unknown",
+            static_cast<unsigned>(
+                all_motors_[i]->getMotorId()));
+    }
+
+    return false;
+}
+
+void MainControlNode::disableAllMotors()
+{
+    RCLCPP_WARN(
+        this->get_logger(),
+        "[Safety] Sending disable command to all motors");
+
+    for (size_t i = 0;
+         i < all_motors_.size();
+         ++i)
+    {
+        if (!all_motors_[i])
+        {
+            continue;
+        }
+
+        if (!all_motors_[i]->disable())
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "[Safety] Disable command TX failed: "
+                "packet_index=%zu bus=%s motor_id=%u",
+                i,
+                i < packet_index_to_bus_.size()
+                    ? packet_index_to_bus_[i].c_str()
+                    : "unknown",
+                static_cast<unsigned>(
+                    all_motors_[i]->getMotorId()));
+        }
+    }
+}
+
+// ------------------------ Lifecycle Callbacks ------------------------
+
 void MainControlNode::resetRuntimeStates()
 {
     walk_initialized_ = false;
@@ -261,29 +580,62 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
 
     for (size_t i = 0; i < all_motors_.size(); ++i)
     {
-        if (all_motors_[i]->enable())
+        if (!all_motors_[i]->enable())
         {
-            RCLCPP_INFO(this->get_logger(),
-                "[Activate] Motor[%zu] enabled successfully", i);
-        }
-        else
-        {
-            RCLCPP_ERROR(this->get_logger(),
-                "[Activate] Failed to enable motor[%zu] (bus=%s, motor_id=%u)",
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "[Activate] Enable command TX failed: "
+                "packet_index=%zu bus=%s motor_id=%u",
                 i,
-                (i < packet_index_to_bus_.size() ? packet_index_to_bus_[i].c_str() : "unknown"),
-                all_motors_[i]->getMotorId());
-            RCLCPP_ERROR(this->get_logger(),
-                "[Activate] Aborting activation due to motor enable failure - HINT: check CAN connections and motor IDs");
+                i < packet_index_to_bus_.size()
+                    ? packet_index_to_bus_[i].c_str()
+                    : "unknown",
+                static_cast<unsigned>(
+                    all_motors_[i]->getMotorId()));
+
+            disableAllMotors();
+
             return CallbackReturn::FAILURE;
         }
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "[Activate] Enable command sent: "
+            "packet_index=%zu bus=%s motor_id=%u",
+            i,
+            i < packet_index_to_bus_.size()
+                ? packet_index_to_bus_[i].c_str()
+                : "unknown",
+            static_cast<unsigned>(
+                all_motors_[i]->getMotorId()));        
     }
-    flushCanRxQueues("after_enable");
 
-    // walk_initialized_ = false;
-    // start_positions_captured_ = false;
-    // init_tick_count_ = 0;
+    // Verify Initial Motor Feedback 
+    constexpr auto activation_timeout =
+        std::chrono::milliseconds(300);
 
+    if (!verifyInitialMotorFeedback(
+            activation_timeout))
+    {
+        RCLCPP_FATAL(
+            this->get_logger(),
+            "[Activate] Motor activation verification failed. "
+            "Control loop will not start.");
+
+        disableAllMotors();
+
+        // Disable 응답은 현재 해석하지 않으므로
+        // 잠시 후 남은 응답만 정리
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10));
+
+        flushCanRxQueues(
+            "activate_failure_after_disable");
+
+        return CallbackReturn::FAILURE;
+    }
+
+    // initial filter 
     velocity_filters_.clear();
     velocity_filters_.reserve(all_motors_.size());
     for (size_t i = 0; i < all_motors_.size(); i++)
@@ -292,6 +644,7 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
     }
     last_velocity_filter_time_ = std::chrono::steady_clock::now();
     velocity_filter_time_initialized_ = false;
+
 
     current_state = ControlState::READ_PACKET;
     timer_ = this->create_wall_timer(
@@ -549,8 +902,22 @@ void MainControlNode::handle_read_packet()
                     continue;
                 }
 
-                if (motor->processPacket(rx_id, rx_data))
+                // if (motor->processPacket(rx_id, rx_data))
+                // {
+                //     if (local_idx < group.global_packet_indices.size())
+                //     {
+                //         const size_t packet_index = group.global_packet_indices[local_idx];
+
+                //         if (packet_index < current_cycle_updated.size())
+                //         {
+                //             current_cycle_updated[packet_index] = true;
+                //         }
+                //     }
+                // }
+                try
                 {
+                    motor->processPacket(rx_id, rx_data);
+
                     if (local_idx < group.global_packet_indices.size())
                     {
                         const size_t packet_index = group.global_packet_indices[local_idx];
@@ -561,7 +928,12 @@ void MainControlNode::handle_read_packet()
                         }
                     }
                 }
-
+                catch (const std::exception& e)
+                {
+                    RCLCPP_ERROR(this->get_logger(),
+                        "Error processing CAN packet for motor_id=%u: %s",
+                        motor_id, e.what());
+                }
                 break;
             }
         }
@@ -1008,7 +1380,7 @@ void MainControlNode::torqueCallback(const std_msgs::msg::Bool::SharedPtr msg)
             if (ok)
             {
                 RCLCPP_INFO(this->get_logger(),
-                    "[Torque Callback] Motor[%zu] enabled successfully", i);
+                    "[Torque Callback] Motor[%zu] enable command sent", i);
             }
             else
             {

@@ -116,7 +116,7 @@ bool RobStrideMotor::sendMotionCommand(float torque, float position, float veloc
     return transport_->send(id, data);
 }
 
-bool RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& rx_data)
+void RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& rx_data)
 {
     uint8_t received_motor_id = RobStrideProtocol::getMotorIdFromCanId(rx_id);
     uint8_t type = RobStrideProtocol::getTypeFromCanId(rx_id);
@@ -124,25 +124,58 @@ bool RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& r
     // 모터 ID 확인
     if (received_motor_id != motor_id_)
     {
-        return false; // 내 데이터 아님
+        throw std::runtime_error(
+            "Received packet motor ID does not match this motor instance: " +
+            std::to_string(received_motor_id) + " != " + std::to_string(motor_id_));
+        // return false;
     }
 
-    // MOTOR_REQUEST 또는 MOTION_CONTROL 응답 모두 피드백으로 처리
-    if (type == ProtocolCmd::MOTOR_REQUEST || type == ProtocolCmd::MOTION_CONTROL)
+    if (type != ProtocolCmd::MOTOR_REQUEST &&
+        type != ProtocolCmd::MOTION_CONTROL)
     {
-        auto [p, v, t, temp, c] = RobStrideProtocol::parseFeedback(
-            rx_data,
-            limits_.pos_limit, limits_.pos_limit,
-            limits_.vel_limit, limits_.vel_limit,
-            limits_.torque_limit
-        );
-
-        position_ = p;
-        velocity_ = v * getVelocityFeedbackScale(); // WJ: 선형 피드백 스케일링
-        torque_ = t;
-        temperature_ = temp;
-        current_ = c;
-        return true;
+        throw std::runtime_error(
+            "Received packet type is not a valid feedback type for this motor: " +
+            std::to_string(type));
+        // return false;
     }
-    return false;
+
+    if (rx_data.size() != 8)
+    {
+        throw std::runtime_error(
+            "Received packet data length is invalid: " +
+            std::to_string(rx_data.size()));
+
+        // return false;
+    }
+
+    auto [p, v, t, temp, c] = RobStrideProtocol::parseFeedback(
+        rx_data,
+        limits_.pos_limit, limits_.pos_limit,
+        limits_.vel_limit, limits_.vel_limit,
+        limits_.torque_limit
+    );
+
+    if (!std::isfinite(p) ||
+        !std::isfinite(v) ||
+        !std::isfinite(t) ||
+        !std::isfinite(temp) ||
+        !std::isfinite(c))
+    {
+        throw std::runtime_error(
+            "Received packet contains non-finite values: " +
+            std::to_string(p) + ", " +
+            std::to_string(v) + ", " +
+            std::to_string(t) + ", " +
+            std::to_string(temp) + ", " +
+            std::to_string(c));
+        // return false;
+    }
+
+    position_ = p;
+    velocity_ = v * getVelocityFeedbackScale(); // WJ: 선형 피드백 스케일링
+    torque_ = t;
+    temperature_ = temp;
+    current_ = c;
+
+    // return true;
 }
