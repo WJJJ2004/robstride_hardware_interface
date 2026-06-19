@@ -145,19 +145,24 @@ bool MainControlNode::processReceivedFrame(
             return false;
         }
 
-        if (!motor->processPacket(rx_id, rx_data))
+        try
         {
-            RCLCPP_WARN(
+            motor->processPacket(rx_id, rx_data);
+        }
+        catch (const std::exception& e)
+        {
+            RCLCPP_ERROR(
                 this->get_logger(),
-                "[%s] Unsupported or invalid motor frame: "
+                "[%s] Invalid motor frame: "
                 "bus=%s motor_id=%u type=%u "
-                "can_id=0x%08X size=%zu",
+                "can_id=0x%08X size=%zu reason=%s",
                 phase,
                 group.interface_name.c_str(),
                 static_cast<unsigned>(motor_id),
                 static_cast<unsigned>(type),
                 rx_id,
-                rx_data.size());
+                rx_data.size(),
+                e.what());
 
             return false;
         }
@@ -930,9 +935,16 @@ void MainControlNode::handle_read_packet()
                 }
                 catch (const std::exception& e)
                 {
-                    RCLCPP_ERROR(this->get_logger(),
-                        "Error processing CAN packet for motor_id=%u: %s",
-                        motor_id, e.what());
+                    RCLCPP_ERROR_THROTTLE(
+                        this->get_logger(),
+                        *this->get_clock(),
+                        1000,
+                        "[Read] Error processing CAN packet: "
+                        "bus=%s motor_id=%u can_id=0x%08X reason=%s",
+                        group.interface_name.c_str(),
+                        static_cast<unsigned>(motor_id),
+                        rx_id,
+                        e.what());
                 }
                 break;
             }

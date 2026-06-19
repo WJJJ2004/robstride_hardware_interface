@@ -1,5 +1,8 @@
 #ifndef MAIN_CONTROL_HPP
 #define MAIN_CONTROL_HPP
+#include <stdexcept>
+#include <string>
+#include <cmath>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"

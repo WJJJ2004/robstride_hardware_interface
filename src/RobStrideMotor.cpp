@@ -124,10 +124,11 @@ void RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& r
     // 모터 ID 확인
     if (received_motor_id != motor_id_)
     {
-        throw std::runtime_error(
-            "Received packet motor ID does not match this motor instance: " +
-            std::to_string(received_motor_id) + " != " + std::to_string(motor_id_));
-        // return false;
+        throw std::invalid_argument(
+            "Packet motor ID mismatch: received=" +
+            std::to_string(received_motor_id) +
+            ", expected=" +
+            std::to_string(motor_id_));
     }
 
     if (type != ProtocolCmd::MOTOR_REQUEST &&

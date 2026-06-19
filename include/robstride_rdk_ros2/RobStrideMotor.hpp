@@ -1,4 +1,7 @@
 #pragma once
+#include <stdexcept>
+#include <string>
+#include <cmath>
 
 #include "CanTransport.hpp"
 #include "RobStrideProtocol.hpp"
