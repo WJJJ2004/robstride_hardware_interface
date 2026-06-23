@@ -36,23 +36,46 @@ enum class ControlState
 
 enum class WriteResult
 {
-    Ok = 0,
-    WouldBlock,   // ENOBUFS, EAGAIN
-    BusDown,      // ENETDOWN, ENODEV
-    IoError,      // generic write failure
-    InvalidArg,
+    Ok,
+    TryAgain,
+    NoBuffer,
+    BusDown,
+    IoError,
+    InvalidArg
 };
-
 struct BusWriteStats
 {
-    uint32_t ok_writes = 0;
-    uint32_t fail_writes = 0;
-    uint32_t enobufs_count = 0;
-    uint32_t consecutive_enobufs = 0;
+    uint32_t ok_writes{0};
+    uint32_t fail_writes{0};
 
-    bool cooldown = false;
-    rclcpp::Time cooldown_until{0, 0, RCL_ROS_TIME};
+    uint32_t eagain_count{0};
+    uint32_t enobufs_count{0};
+
+    uint32_t consecutive_eagain_cycles{0};
+    uint32_t consecutive_enobufs_cycles{0};
+
+    bool eagain_active{false};
+
+    std::chrono::steady_clock::time_point
+        first_eagain_time{};
+
+    bool cooldown{false};
+    rclcpp::Time cooldown_until{
+        0,
+        0,
+        RCL_ROS_TIME
+    };
 };
+// struct BusWriteStats
+// {
+//     uint32_t ok_writes = 0;
+//     uint32_t fail_writes = 0;
+//     uint32_t enobufs_count = 0;
+//     uint32_t consecutive_enobufs = 0;
+
+//     bool cooldown = false;
+//     rclcpp::Time cooldown_until{0, 0, RCL_ROS_TIME};
+// };
 
 struct MotorWriteStats
 {

@@ -775,18 +775,46 @@ void MainControlNode::transition_to(ControlState new_state)
     current_state = new_state;
 }
 
-const char* MainControlNode::toString(WriteResult result) const
+const char* MainControlNode::toString(
+    WriteResult result) const
 {
     switch (result)
     {
-        case WriteResult::Ok:         return "Ok";
-        case WriteResult::WouldBlock: return "WouldBlock";
-        case WriteResult::BusDown:    return "BusDown";
-        case WriteResult::IoError:    return "IoError";
-        case WriteResult::InvalidArg: return "InvalidArg";
-        default:                      return "Unknown";
+        case WriteResult::Ok:
+            return "Ok";
+
+        case WriteResult::TryAgain:
+            return "TryAgain";
+
+        case WriteResult::NoBuffer:
+            return "NoBuffer";
+
+        case WriteResult::BusDown:
+            return "BusDown";
+
+        case WriteResult::IoError:
+            return "IoError";
+
+        case WriteResult::InvalidArg:
+            return "InvalidArg";
+
+        default:
+            return "Unknown";
     }
 }
+
+// const char* MainControlNode::toString(WriteResult result) const
+// {
+//     switch (result)
+//     {
+//         case WriteResult::Ok:         return "Ok";
+//         case WriteResult::WouldBlock: return "WouldBlock";
+//         case WriteResult::BusDown:    return "BusDown";
+//         case WriteResult::IoError:    return "IoError";
+//         case WriteResult::InvalidArg: return "InvalidArg";
+//         default:                      return "Unknown";
+//     }
+// }
 
 float MainControlNode::computeWrappedCommand(float current_raw_pos, float target_wrapped_pos) const
 {
@@ -810,25 +838,43 @@ WriteResult MainControlNode::safeSendCommand(
 {
     errno = 0;
 
-    const bool ok = motor.sendMotionCommand(torque, position, velocity, kp, kd);
+    const bool ok = motor.sendMotionCommand(
+        torque,
+        position,
+        velocity,
+        kp,
+        kd);
+
     if (ok)
     {
         return WriteResult::Ok;
     }
 
-    switch (errno)
+    const int saved_errno = errno;
+
+    if (saved_errno == EAGAIN ||
+        saved_errno == EWOULDBLOCK)
     {
-        case ENOBUFS:
-        case EAGAIN:
-            return WriteResult::WouldBlock;
-        case ENETDOWN:
-        case ENODEV:
-            return WriteResult::BusDown;
-        case EINVAL:
-            return WriteResult::InvalidArg;
-        default:
-            return WriteResult::IoError;
+        return WriteResult::TryAgain;
     }
+
+    if (saved_errno == ENOBUFS)
+    {
+        return WriteResult::NoBuffer;
+    }
+
+    if (saved_errno == ENETDOWN ||
+        saved_errno == ENODEV)
+    {
+        return WriteResult::BusDown;
+    }
+
+    if (saved_errno == EINVAL)
+    {
+        return WriteResult::InvalidArg;
+    }
+
+    return WriteResult::IoError;
 }
 
 void MainControlNode::printInitialRawPositionsOnce(const char* tag)
@@ -1083,14 +1129,26 @@ void MainControlNode::logWriteSummaryThrottle()
 {
     for (const auto& group : can_groups_)
     {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-            "[WriteSummary] bus=%s ok=%u fail=%u enobufs_total=%u enobufs_streak=%u cooldown=%s",
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            5000,
+            "[WriteSummary] "
+            "bus=%s "
+            "ok=%u fail=%u "
+            "eagain_total=%u "
+            "eagain_cycles=%u "
+            "enobufs_total=%u "
+            "enobufs_cycles=%u",
             group.interface_name.c_str(),
             group.write_stats.ok_writes,
             group.write_stats.fail_writes,
+            group.write_stats.eagain_count,
+            group.write_stats
+                .consecutive_eagain_cycles,
             group.write_stats.enobufs_count,
-            group.write_stats.consecutive_enobufs,
-            group.write_stats.cooldown ? "true" : "false");
+            group.write_stats
+                .consecutive_enobufs_cycles);
     }
 }
 
@@ -1100,6 +1158,9 @@ void MainControlNode::handle_write_packet()
     //     "[Write] ENTER packet_initialized=%s walk_initialized=%s",
     //     packet_initialized_ ? "true" : "false",
     //     walk_initialized_ ? "true" : "false");
+    constexpr auto EAGAIN_FATAL_DURATION =
+        std::chrono::milliseconds(200);
+    constexpr uint32_t ENOBUFS_FATAL_CYCLES = 5;
 
     float alpha = 0.0f;
 
@@ -1194,18 +1255,9 @@ void MainControlNode::handle_write_packet()
 
     for (auto& group : can_groups_)
     {
-        const auto now = this->get_clock()->now();
-
-        if (group.write_stats.cooldown && now < group.write_stats.cooldown_until)
-        {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[Write] bus=%s in cooldown",
-                group.interface_name.c_str());
-            continue;
-        }
-
-        group.write_stats.cooldown = false;
-        bool bus_blocked_this_cycle = false;
+        bool eagain_this_cycle = false;
+        bool enobufs_this_cycle = false;
+        bool bus_down_this_cycle = false;
 
         for (size_t local_idx = 0; local_idx < group.motors.size(); ++local_idx)
         {
@@ -1274,7 +1326,7 @@ void MainControlNode::handle_write_packet()
             {
                 motor_write_stats_[packet_index].consecutive_failures = 0;
                 ++group.write_stats.ok_writes;
-                group.write_stats.consecutive_enobufs = 0;
+                // group.write_stats.consecutive_enobufs = 0;
                 continue;
             }
 
@@ -1283,60 +1335,204 @@ void MainControlNode::handle_write_packet()
 
             const char* phase = walk_initialized_ ? "track" : "init";
 
-            if (result == WriteResult::WouldBlock)
+            if (result == WriteResult::TryAgain)
+            {
+                ++group.write_stats.eagain_count;
+
+                eagain_this_cycle = true;
+
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "[Write] EAGAIN: "
+                    "phase=%s bus=%s motor_id=%u "
+                    "packet_index=%zu total=%u",
+                    phase,
+                    group.interface_name.c_str(),
+                    cmd.motor_id,
+                    packet_index,
+                    group.write_stats.eagain_count);
+
+                // TX 큐가 현재 가득 차 있으므로
+                // 나머지 모터도 실패할 가능성이 높음
+                break;
+            }
+
+            if (result == WriteResult::NoBuffer)
             {
                 ++group.write_stats.enobufs_count;
-                ++group.write_stats.consecutive_enobufs;
 
-                // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                //     "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s motor_fail_streak=%u bus_enobufs_streak=%u",
-                //     phase,
-                //     group.interface_name.c_str(),
-                //     cmd.motor_id,
-                //     packet_index,
-                //     toString(result),
-                //     motor_write_stats_[packet_index].consecutive_failures,
-                //     group.write_stats.consecutive_enobufs);
+                enobufs_this_cycle = true;
 
-                bus_blocked_this_cycle = true;
+                RCLCPP_ERROR_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "[Write] ENOBUFS: "
+                    "phase=%s bus=%s motor_id=%u "
+                    "packet_index=%zu total=%u",
+                    phase,
+                    group.interface_name.c_str(),
+                    cmd.motor_id,
+                    packet_index,
+                    group.write_stats.enobufs_count);
+
                 break;
             }
 
             if (result == WriteResult::BusDown)
             {
-                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s",
+                bus_down_this_cycle = true;
+
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[Write] CAN bus unavailable: "
+                    "phase=%s bus=%s motor_id=%u "
+                    "packet_index=%zu",
                     phase,
                     group.interface_name.c_str(),
                     cmd.motor_id,
-                    packet_index,
-                    toString(result));
+                    packet_index);
 
-                bus_blocked_this_cycle = true;
                 break;
             }
+            // if (result == WriteResult::WouldBlock)
+            // {
+            //     ++group.write_stats.enobufs_count;
+            //     ++group.write_stats.consecutive_enobufs;
 
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s fail_streak=%u",
+            //     // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            //     //     "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s motor_fail_streak=%u bus_enobufs_streak=%u",
+            //     //     phase,
+            //     //     group.interface_name.c_str(),
+            //     //     cmd.motor_id,
+            //     //     packet_index,
+            //     //     toString(result),
+            //     //     motor_write_stats_[packet_index].consecutive_failures,
+            //     //     group.write_stats.consecutive_enobufs);
+
+            //     bus_blocked_this_cycle = true;
+            //     break;
+            // }
+
+            // if (result == WriteResult::BusDown)
+            // {
+            //     RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            //         "[Write] phase=%s bus=%s motor_id=%u packet_index=%zu result=%s",
+            //         phase,
+            //         group.interface_name.c_str(),
+            //         cmd.motor_id,
+            //         packet_index,
+            //         toString(result));
+
+            //     bus_blocked_this_cycle = true;
+            //     break;
+            // }
+
+            RCLCPP_ERROR_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "[Write] phase=%s bus=%s "
+                "motor_id=%u packet_index=%zu "
+                "result=%s fail_streak=%u",
                 phase,
                 group.interface_name.c_str(),
                 cmd.motor_id,
                 packet_index,
                 toString(result),
-                motor_write_stats_[packet_index].consecutive_failures);
+                motor_write_stats_[packet_index]
+                    .consecutive_failures);
+        } // 모터 반복문 end
+
+        if (bus_down_this_cycle)
+        {
+            RCLCPP_FATAL(
+                this->get_logger(),
+                "[Safety] CAN bus unavailable: bus=%s",
+                group.interface_name.c_str());
+
+            timer_.reset();
+            // disableAllMotors();
+
+            return;
         }
 
-        if (bus_blocked_this_cycle &&
-            group.write_stats.consecutive_enobufs >= enobufs_cooldown_threshold_)
+        if (eagain_this_cycle)
         {
-            group.write_stats.cooldown = true;
-            group.write_stats.cooldown_until = now + bus_write_cooldown_;
+            ++group.write_stats.consecutive_eagain_cycles;
 
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[Write] bus=%s entered cooldown: enobufs_streak=%u cooldown_ms=%.1f",
+            if (!group.write_stats.eagain_active)
+            {
+                group.write_stats.eagain_active = true;
+                group.write_stats.first_eagain_time =
+                    std::chrono::steady_clock::now();
+            }
+        }
+        else
+        {
+            group.write_stats.consecutive_eagain_cycles = 0;
+            group.write_stats.eagain_active = false;
+        }
+
+        if (enobufs_this_cycle)
+        {
+            ++group.write_stats.consecutive_enobufs_cycles;
+        }
+        else
+        {
+            group.write_stats.consecutive_enobufs_cycles = 0;
+        }
+
+        if (group.write_stats.eagain_active)
+        {
+            const auto now_steady =
+                std::chrono::steady_clock::now();
+
+            const auto elapsed =
+                now_steady -
+                group.write_stats.first_eagain_time;
+
+            if (elapsed >= EAGAIN_FATAL_DURATION)
+            {
+                const auto elapsed_ms =
+                    std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                        elapsed)
+                        .count();
+
+                RCLCPP_FATAL(
+                    this->get_logger(),
+                    "[Safety] Persistent CAN EAGAIN: "
+                    "bus=%s duration=%ld ms "
+                    "failed_cycles=%u",
+                    group.interface_name.c_str(),
+                    static_cast<long>(elapsed_ms),
+                    group.write_stats
+                        .consecutive_eagain_cycles);
+
+                timer_.reset();
+                // disableAllMotors();
+
+                return;
+            }
+        }
+
+        if (group.write_stats.consecutive_enobufs_cycles >=
+            ENOBUFS_FATAL_CYCLES)
+        {
+            RCLCPP_FATAL(
+                this->get_logger(),
+                "[Safety] Persistent ENOBUFS: "
+                "bus=%s cycles=%u",
                 group.interface_name.c_str(),
-                group.write_stats.consecutive_enobufs,
-                bus_write_cooldown_.seconds() * 1000.0);
+                group.write_stats
+                    .consecutive_enobufs_cycles);
+
+            timer_.reset();
+            // disableAllMotors();
+            return;
         }
     }
 
