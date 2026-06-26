@@ -671,7 +671,8 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
 
     current_state = ControlState::READ_PACKET;
     timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(5), // 50 hz timer
+        std::chrono::microseconds(3333), // 300hz control loop -> HW control 150hz
+        // std::chrono::milliseconds(5), // 200 hz timer -> Low-Level Control Freq 100 Hz
         std::bind(&MainControlNode::control_loop, this));
 
     RCLCPP_INFO(this->get_logger(),
