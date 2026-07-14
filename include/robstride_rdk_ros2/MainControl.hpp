@@ -27,7 +27,17 @@
 #include <iomanip>
 #include <mutex>
 #include <chrono>
+#include <deque>
+#include <algorithm>
 
+enum class InitPhase    // WJ: 초기화시 모터 상태 확인
+{
+    COLLECT_FEEDBACK,   // Zero Command를 보내며 피드백 수집
+    WAIT_COMMAND,       // 초기 위치 확정 후 상위 명령 대기
+    INTERPOLATING,      // 초기 위치에서 목표 위치까지 이동
+    RUNNING,            // 정상 제어
+    FAILED
+};
 enum class ControlState
 {
     WRITE_PACKET,
@@ -43,6 +53,13 @@ enum class WriteResult
     IoError,
     InvalidArg
 };
+enum class InitSampleCheckResult
+{
+    Collecting,  // 아직 샘플이 부족함
+    Ready,       // 샘플이 충분하고 안정적임
+    Fatal        // 샘플은 충분하지만 비정상 상태
+};
+
 struct BusWriteStats
 {
     uint32_t ok_writes{0};
@@ -106,6 +123,7 @@ public:
     on_activate(const rclcpp_lifecycle::State &);
 
 private:
+    void publishWalkInitialized(bool initialized);
     void flushCanRxQueues(const char* tag);
     void control_loop();
     void walkCallback(const roa_interfaces::msg::MotorCommandArray::SharedPtr msg);
@@ -134,7 +152,7 @@ private:
     float computeWrappedCommand(float current_raw_pos, float target_wrapped_pos) const;
     void resetRuntimeStates();
     void logWriteSummaryThrottle();
-    bool isStartPositionReady(std::string* reason);
+    // bool isStartPositionReady(std::string* reason);
 
     std::vector<CanBusGroup> can_groups_;
     std::vector<std::shared_ptr<RobStrideMotor>> all_motors_;
@@ -181,7 +199,7 @@ private:
     std::vector<float> last_valid_motor_pos_;
 
     // For debugging
-    void printInitialRawPositionsOnce(const char* tag);
+    // void printInitialRawPositionsOnce(const char* tag);
     bool initial_raw_position_printed_ = false;
 
     // for initial feedback verification
@@ -196,6 +214,38 @@ private:
         const std::vector<uint8_t>& rx_data,
         const char* phase);
     void requestFatalShutdown(const std::string& reason);
+
+
+    // ----------------------------- WJ 초기 피드백 수집 및 상태 확인 -----------------------------
+    bool sendZeroCommands();
+    InitSampleCheckResult checkInitialSamples(
+        std::string* reason) const;
+    float computeMedian(const std::deque<float>& samples) const;
+
+    static constexpr std::size_t INIT_REQUIRED_SAMPLES = 20;
+
+    // 초기 피드백의 위치 변화 허용 범위
+    static constexpr float INIT_POSITION_SPREAD_LIMIT = 0.03f;
+
+    // 초기 상태에서 허용할 최대 속도
+    static constexpr float INIT_VELOCITY_LIMIT = 0.5f;
+
+    // 피드백이 이 시간보다 오래되면 stale로 판단
+    static constexpr int INIT_FEEDBACK_STALE_MS = 100;
+
+    // 초기 피드백 수집 전체 제한 시간
+    static constexpr int INIT_COLLECTION_TIMEOUT_MS = 2000;
+
+    InitPhase init_phase_ = InitPhase::COLLECT_FEEDBACK;
+
+    std::vector<std::deque<float>> init_position_samples_;
+    std::vector<std::deque<float>> init_velocity_samples_;
+
+    std::vector<std::chrono::steady_clock::time_point>
+        last_feedback_time_;
+
+    std::chrono::steady_clock::time_point
+        init_phase_start_time_;
 };
 
 #endif // MAIN_CONTROL_HPP

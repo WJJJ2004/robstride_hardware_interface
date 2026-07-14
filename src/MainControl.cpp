@@ -411,6 +411,185 @@ void MainControlNode::disableAllMotors()
     }
 }
 
+float MainControlNode::computeMedian(
+    const std::deque<float>& samples) const
+{
+    if (samples.empty())
+    {
+        return 0.0f;
+    }
+
+    std::vector<float> sorted(
+        samples.begin(),
+        samples.end());
+
+    std::sort(
+        sorted.begin(),
+        sorted.end());
+
+    const size_t n = sorted.size();
+
+    if ((n % 2) == 1)
+    {
+        return sorted[n / 2];
+    }
+
+    return 0.5f *
+        (sorted[n / 2 - 1] +
+         sorted[n / 2]);
+}
+
+InitSampleCheckResult
+MainControlNode::checkInitialSamples(
+    std::string* reason) const
+{
+    if (init_position_samples_.size() != all_motors_.size() ||
+        init_velocity_samples_.size() != all_motors_.size() ||
+        last_feedback_time_.size() != all_motors_.size())
+    {
+        if (reason)
+        {
+            *reason = "initial sample buffer size mismatch";
+        }
+
+        return InitSampleCheckResult::Fatal;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    for (size_t i = 0; i < all_motors_.size(); ++i)
+    {
+        const auto& q_samples =
+            init_position_samples_[i];
+
+        const auto& qdot_samples =
+            init_velocity_samples_[i];
+
+        // 아직 필요한 개수만큼 수집되지 않은 경우
+        if (q_samples.size() < INIT_REQUIRED_SAMPLES ||
+            qdot_samples.size() < INIT_REQUIRED_SAMPLES)
+        {
+            if (reason)
+            {
+                *reason =
+                    "motor=" + std::to_string(i) +
+                    " q_samples=" +
+                    std::to_string(q_samples.size()) +
+                    " qdot_samples=" +
+                    std::to_string(qdot_samples.size());
+            }
+
+            return InitSampleCheckResult::Collecting;
+        }
+
+        const auto feedback_age =
+            std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                now - last_feedback_time_[i]);
+
+        if (feedback_age.count() >
+            INIT_FEEDBACK_STALE_MS)
+        {
+            if (reason)
+            {
+                *reason =
+                    "stale feedback: motor=" +
+                    std::to_string(i) +
+                    " age_ms=" +
+                    std::to_string(feedback_age.count());
+            }
+
+            return InitSampleCheckResult::Fatal;
+        }
+
+        const auto minmax =
+            std::minmax_element(
+                q_samples.begin(),
+                q_samples.end());
+
+        const float q_min = *minmax.first;
+        const float q_max = *minmax.second;
+        const float position_spread = q_max - q_min;
+
+        if (!std::isfinite(position_spread))
+        {
+            if (reason)
+            {
+                *reason =
+                    "non-finite position spread: motor=" +
+                    std::to_string(i);
+            }
+
+            return InitSampleCheckResult::Fatal;
+        }
+
+        if (position_spread >
+            INIT_POSITION_SPREAD_LIMIT)
+        {
+            if (reason)
+            {
+                *reason =
+                    "position spread too large: motor=" +
+                    std::to_string(i) +
+                    " motor_id=" +
+                    std::to_string(
+                        all_motors_[i]->getMotorId()) +
+                    " min=" +
+                    std::to_string(q_min) +
+                    " max=" +
+                    std::to_string(q_max) +
+                    " spread=" +
+                    std::to_string(position_spread) +
+                    " limit=" +
+                    std::to_string(
+                        INIT_POSITION_SPREAD_LIMIT);
+            }
+
+            return InitSampleCheckResult::Fatal;
+        }
+
+        for (const float qdot : qdot_samples)
+        {
+            if (!std::isfinite(qdot))
+            {
+                if (reason)
+                {
+                    *reason =
+                        "non-finite velocity sample: motor=" +
+                        std::to_string(i);
+                }
+
+                return InitSampleCheckResult::Fatal;
+            }
+
+            if (std::fabs(qdot) >
+                INIT_VELOCITY_LIMIT)
+            {
+                if (reason)
+                {
+                    *reason =
+                        "initial velocity too large: motor=" +
+                        std::to_string(i) +
+                        " qdot=" +
+                        std::to_string(qdot) +
+                        " limit=" +
+                        std::to_string(
+                            INIT_VELOCITY_LIMIT);
+                }
+
+                return InitSampleCheckResult::Fatal;
+            }
+        }
+    }
+
+    if (reason)
+    {
+        *reason = "ready";
+    }
+
+    return InitSampleCheckResult::Ready;
+}
+
 // ------------------------ Lifecycle Callbacks ------------------------
 
 void MainControlNode::resetRuntimeStates()
@@ -426,8 +605,25 @@ void MainControlNode::resetRuntimeStates()
     packet_initialized_ = false;
     initial_raw_position_printed_ = false;
 
-    motor_feedback_seen_.assign(all_motors_.size(), false);
-    last_valid_motor_pos_.assign(all_motors_.size(), 0.0f);
+    motor_feedback_seen_.assign(
+        all_motors_.size(), false);
+
+    last_valid_motor_pos_.assign(
+        all_motors_.size(), 0.0f);
+
+    init_position_samples_.clear();
+    init_position_samples_.resize(all_motors_.size());
+
+    init_velocity_samples_.clear();
+    init_velocity_samples_.resize(all_motors_.size());
+
+    last_feedback_time_.assign(
+        all_motors_.size(),
+        std::chrono::steady_clock::time_point{});
+
+    init_phase_ = InitPhase::COLLECT_FEEDBACK;
+    init_phase_start_time_ =
+        std::chrono::steady_clock::now();
 
     for (auto& group : can_groups_)
     {
@@ -587,9 +783,12 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
     return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
+CallbackReturn MainControlNode::on_activate(
+    const rclcpp_lifecycle::State &)
 {
-    RCLCPP_INFO(this->get_logger(), "[Activate] Activating...");
+    RCLCPP_INFO(
+        this->get_logger(),
+        "[Activate] Activating...");
 
     resetRuntimeStates();
     flushCanRxQueues("before_enable");
@@ -598,88 +797,80 @@ CallbackReturn MainControlNode::on_activate(const rclcpp_lifecycle::State &)
     {
         if (!all_motors_[i]->enable())
         {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "[Activate] Enable command TX failed: "
-                "packet_index=%zu bus=%s motor_id=%u",
-                i,
-                i < packet_index_to_bus_.size()
-                    ? packet_index_to_bus_[i].c_str()
-                    : "unknown",
-                static_cast<unsigned>(
-                    all_motors_[i]->getMotorId()));
-            // disableAllMotors();
             requestFatalShutdown(
                 "[Activate] Enable command TX failed: "
-                "packet_index=" + std::to_string(i) +
-                " bus=" + (i < packet_index_to_bus_.size() ? packet_index_to_bus_[i] : "unknown") +
-                " motor_id=" + std::to_string(all_motors_[i]->getMotorId()));
+                "packet_index=" + std::to_string(i));
 
             return CallbackReturn::FAILURE;
         }
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "[Activate] Enable command sent: "
-            "packet_index=%zu bus=%s motor_id=%u",
-            i,
-            i < packet_index_to_bus_.size()
-                ? packet_index_to_bus_[i].c_str()
-                : "unknown",
-            static_cast<unsigned>(
-                all_motors_[i]->getMotorId()));        
     }
 
-    // Verify Initial Motor Feedback 
-    constexpr auto activation_timeout =
-        std::chrono::milliseconds(300);
-
-    if (!verifyInitialMotorFeedback(
-            activation_timeout))
-    {
-        RCLCPP_FATAL(
-            this->get_logger(),
-            "[Activate] Motor activation verification failed. "
-            "Control loop will not start.");
-
-        disableAllMotors();
-
-        // Disable 응답은 현재 해석하지 않으므로
-        // 잠시 후 남은 응답만 정리
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(10));
-
-        flushCanRxQueues(
-            "activate_failure_after_disable");
-        requestFatalShutdown(
-            "[Activate] Motor activation verification failed. "
-            "Control loop will not start.");
-
-        return CallbackReturn::FAILURE;
-    }
-
-    // initial filter 
     velocity_filters_.clear();
     velocity_filters_.reserve(all_motors_.size());
-    for (size_t i = 0; i < all_motors_.size(); i++)
+
+    for (size_t i = 0; i < all_motors_.size(); ++i)
     {
-        velocity_filters_.emplace_back(3.0f); // 23 hz -> 10 hz로 낮춰서 더 부드럽게
+        velocity_filters_.emplace_back(3.0f);
     }
-    last_velocity_filter_time_ = std::chrono::steady_clock::now();
+
+    last_velocity_filter_time_ =
+        std::chrono::steady_clock::now();
+
     velocity_filter_time_initialized_ = false;
 
+    init_phase_ = InitPhase::COLLECT_FEEDBACK;
+    init_phase_start_time_ =
+        std::chrono::steady_clock::now();
 
-    current_state = ControlState::READ_PACKET;
+    current_state = ControlState::WRITE_PACKET;
+
     timer_ = this->create_wall_timer(
-        std::chrono::microseconds(3333), // 300hz control loop -> HW control 150hz
-        // std::chrono::milliseconds(5), // 200 hz timer -> Low-Level Control Freq 100 Hz
-        std::bind(&MainControlNode::control_loop, this));
+        std::chrono::microseconds(3333),
+        std::bind(
+            &MainControlNode::control_loop,
+            this));
 
-    RCLCPP_INFO(this->get_logger(),
-        "[Activate] Activated successfully with %zu motors",
-        all_motors_.size());
+    RCLCPP_INFO(
+        this->get_logger(),
+        "[Activate] Zero-command feedback collection started");
 
     return CallbackReturn::SUCCESS;
+}
+
+bool MainControlNode::sendZeroCommands()
+{
+    bool all_ok = true;
+
+    for (auto& group : can_groups_)
+    {
+        for (size_t local_idx = 0;
+             local_idx < group.motors.size();
+             ++local_idx)
+        {
+            auto& motor = group.motors[local_idx];
+
+            const WriteResult result =
+                safeSendCommand(
+                    *motor,
+                    0.0f,  // torque
+                    0.0f,  // position
+                    0.0f,  // velocity
+                    0.0f,  // kp
+                    0.0f); // kd
+            if (result != WriteResult::Ok)
+            {
+                all_ok = false;
+
+                requestFatalShutdown(
+                    "[Safety] Zero-command TX failed: "
+                    "bus=" + group.interface_name +
+                    " motor_id=" + std::to_string(motor->getMotorId()) +
+                    " reason=" + toString(result));
+            }
+        }
+    }
+
+    return all_ok;
 }
 
 void MainControlNode::control_loop()
@@ -717,59 +908,59 @@ void MainControlNode::control_loop()
             break;
     }
 }
-bool MainControlNode::isStartPositionReady(std::string* reason)
-{
-    if (all_motors_.empty())
-    {
-        if (reason) *reason = "all_motors_ is empty";
-        return false;
-    }
+// bool MainControlNode::isStartPositionReady(std::string* reason)
+// {
+//     if (all_motors_.empty())
+//     {
+//         if (reason) *reason = "all_motors_ is empty";
+//         return false;
+//     }
 
-    if (motor_feedback_seen_.size() != all_motors_.size() ||
-        last_valid_motor_pos_.size() != all_motors_.size())
-    {
-        if (reason) *reason = "init validation buffers size mismatch";
-        return false;
-    }
+//     if (motor_feedback_seen_.size() != all_motors_.size() ||
+//         last_valid_motor_pos_.size() != all_motors_.size())
+//     {
+//         if (reason) *reason = "init validation buffers size mismatch";
+//         return false;
+//     }
 
-    for (size_t i = 0; i < all_motors_.size(); ++i)
-    {
-        if (!motor_feedback_seen_[i])
-        {
-            if (reason)
-            {
-                *reason = "motor " + std::to_string(i) +
-                          " valid feedback not seen yet";
-            }
-            return false;
-        }
+//     for (size_t i = 0; i < all_motors_.size(); ++i)
+//     {
+//         if (!motor_feedback_seen_[i])
+//         {
+//             if (reason)
+//             {
+//                 *reason = "motor " + std::to_string(i) +
+//                           " valid feedback not seen yet";
+//             }
+//             return false;
+//         }
 
-        const float q = last_valid_motor_pos_[i];
+//         const float q = last_valid_motor_pos_[i];
 
-        if (!std::isfinite(q))
-        {
-            if (reason)
-            {
-                *reason = "motor " + std::to_string(i) +
-                          " q is not finite";
-            }
-            return false;
-        }
+//         if (!std::isfinite(q))
+//         {
+//             if (reason)
+//             {
+//                 *reason = "motor " + std::to_string(i) +
+//                           " q is not finite";
+//             }
+//             return false;
+//         }
 
-        if (std::fabs(q) > INIT_Q_ABS_LIMIT)
-        {
-            if (reason)
-            {
-                *reason = "motor " + std::to_string(i) +
-                          " q out of range: " + std::to_string(q);
-            }
-            return false;
-        }
-    }
+//         if (std::fabs(q) > INIT_Q_ABS_LIMIT)
+//         {
+//             if (reason)
+//             {
+//                 *reason = "motor " + std::to_string(i) +
+//                           " q out of range: " + std::to_string(q);
+//             }
+//             return false;
+//         }
+//     }
 
-    if (reason) *reason = "ready";
-    return true;
-}
+//     if (reason) *reason = "ready";
+//     return true;
+// }
 
 void MainControlNode::transition_to(ControlState new_state)
 {
@@ -878,54 +1069,54 @@ WriteResult MainControlNode::safeSendCommand(
     return WriteResult::IoError;
 }
 
-void MainControlNode::printInitialRawPositionsOnce(const char* tag)
-{
-    if (initial_raw_position_printed_)
-    {
-        return;
-    }
+// void MainControlNode::printInitialRawPositionsOnce(const char* tag)
+// {
+//     if (initial_raw_position_printed_)
+//     {
+//         return;
+//     }
 
-    initial_raw_position_printed_ = true;
+//     initial_raw_position_printed_ = true;
 
-    RCLCPP_WARN(this->get_logger(),
-        "==================== [Initial Raw Position Debug: %s] ====================",
-        tag);
+//     RCLCPP_WARN(this->get_logger(),
+//         "==================== [Initial Raw Position Debug: %s] ====================",
+//         tag);
 
-    for (size_t i = 0; i < all_motors_.size(); ++i)
-    {
-        const float raw_q = static_cast<float>(all_motors_[i]->getPosition());
-        const float wrapped_q = wrapToPi(raw_q);
-        const float turns = raw_q / (2.0f * static_cast<float>(M_PI));
+//     for (size_t i = 0; i < all_motors_.size(); ++i)
+//     {
+//         const float raw_q = static_cast<float>(all_motors_[i]->getPosition());
+//         const float wrapped_q = wrapToPi(raw_q);
+//         const float turns = raw_q / (2.0f * static_cast<float>(M_PI));
 
-        const bool seen =
-            (i < motor_feedback_seen_.size()) ? motor_feedback_seen_[i] : false;
+//         const bool seen =
+//             (i < motor_feedback_seen_.size()) ? motor_feedback_seen_[i] : false;
 
-        const float last_valid_q =
-            (i < last_valid_motor_pos_.size()) ? last_valid_motor_pos_[i] : 0.0f;
+//         const float last_valid_q =
+//             (i < last_valid_motor_pos_.size()) ? last_valid_motor_pos_[i] : 0.0f;
 
-        const float last_valid_wrapped = wrapToPi(last_valid_q);
-        const float last_valid_turns =
-            last_valid_q / (2.0f * static_cast<float>(M_PI));
+//         const float last_valid_wrapped = wrapToPi(last_valid_q);
+//         const float last_valid_turns =
+//             last_valid_q / (2.0f * static_cast<float>(M_PI));
 
-        RCLCPP_WARN(this->get_logger(),
-            "[InitialRawQ] packet_index=%zu motor_id=%u bus=%s seen=%s "
-            "raw_q=%.6f wrapped_q=%.6f turns=%.3f "
-            "last_valid_q=%.6f last_valid_wrapped=%.6f last_valid_turns=%.3f",
-            i,
-            all_motors_[i]->getMotorId(),
-            (i < packet_index_to_bus_.size() ? packet_index_to_bus_[i].c_str() : "unknown"),
-            seen ? "true" : "false",
-            raw_q,
-            wrapped_q,
-            turns,
-            last_valid_q,
-            last_valid_wrapped,
-            last_valid_turns);
-    }
+//         RCLCPP_WARN(this->get_logger(),
+//             "[InitialRawQ] packet_index=%zu motor_id=%u bus=%s seen=%s "
+//             "raw_q=%.6f wrapped_q=%.6f turns=%.3f "
+//             "last_valid_q=%.6f last_valid_wrapped=%.6f last_valid_turns=%.3f",
+//             i,
+//             all_motors_[i]->getMotorId(),
+//             (i < packet_index_to_bus_.size() ? packet_index_to_bus_[i].c_str() : "unknown"),
+//             seen ? "true" : "false",
+//             raw_q,
+//             wrapped_q,
+//             turns,
+//             last_valid_q,
+//             last_valid_wrapped,
+//             last_valid_turns);
+//     }
 
-    RCLCPP_WARN(this->get_logger(),
-        "==========================================================================");
-}
+//     RCLCPP_WARN(this->get_logger(),
+//         "==========================================================================");
+// }
 
 void MainControlNode::handle_read_packet()
 {
@@ -1053,25 +1244,81 @@ void MainControlNode::handle_read_packet()
             const float raw_velocity = static_cast<float>(all_motors_[i]->getVelocity());
             const float current  = static_cast<float>(all_motors_[i]->getCurrent());
 
+            const bool valid_feedback =
+                std::isfinite(raw_pos) &&
+                std::isfinite(raw_velocity) &&
+                std::isfinite(current) &&
+                std::fabs(raw_pos) <= INIT_Q_ABS_LIMIT &&
+                std::fabs(raw_velocity) <= INIT_VELOCITY_LIMIT;
+
             // ===== Init last valid q update =====
-            if (std::isfinite(raw_pos) && std::fabs(raw_pos) <= INIT_Q_ABS_LIMIT)
+            // if (std::isfinite(raw_pos) && std::fabs(raw_pos) <= INIT_Q_ABS_LIMIT)
+            // {
+            //     if (i < motor_feedback_seen_.size())
+            //     {
+            //         motor_feedback_seen_[i] = true;
+            //     }
+
+            //     if (i < last_valid_motor_pos_.size())
+            //     {
+            //         last_valid_motor_pos_[i] = raw_pos;
+            //     }
+            // }
+            // else
+            // {
+            //     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            //         "[InitValidation] Invalid q feedback ignored. motor_index=%zu raw_pos=%.6f",
+            //         i,
+            //         raw_pos);
+            // }
+            if (init_phase_ == InitPhase::COLLECT_FEEDBACK)
             {
-                if (i < motor_feedback_seen_.size())
+                if (valid_feedback)
                 {
                     motor_feedback_seen_[i] = true;
-                }
-
-                if (i < last_valid_motor_pos_.size())
-                {
                     last_valid_motor_pos_[i] = raw_pos;
+                    last_feedback_time_[i] =
+                        std::chrono::steady_clock::now();
+
+                    auto& q_samples =
+                        init_position_samples_[i];
+
+                    auto& qdot_samples =
+                        init_velocity_samples_[i];
+
+                    q_samples.push_back(raw_pos);
+                    qdot_samples.push_back(raw_velocity);
+
+                    if (q_samples.size() >
+                        INIT_REQUIRED_SAMPLES)
+                    {
+                        q_samples.pop_front();
+                    }
+
+                    if (qdot_samples.size() >
+                        INIT_REQUIRED_SAMPLES)
+                    {
+                        qdot_samples.pop_front();
+                    }
                 }
-            }
-            else
-            {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "[InitValidation] Invalid q feedback ignored. motor_index=%zu raw_pos=%.6f",
-                    i,
-                    raw_pos);
+                else
+                {
+                    RCLCPP_WARN_THROTTLE(
+                        this->get_logger(),
+                        *this->get_clock(),
+                        1000,
+                        "[InitCollect] Invalid feedback: "
+                        "motor=%zu q=%.6f qdot=%.6f current=%.6f",
+                        i,
+                        raw_pos,
+                        raw_velocity,
+                        current);
+
+                    // 연속 정상 샘플을 요구한다면 비정상값 발생 시 초기화
+                    init_position_samples_[i].clear();
+                    init_velocity_samples_[i].clear();
+                    motor_feedback_seen_[i] = false;
+                }
             }
 
             float velocity = raw_velocity;
@@ -1121,6 +1368,101 @@ void MainControlNode::handle_read_packet()
         last_read_cycle_all_updated_ = true;
     }
 
+    if (init_phase_ == InitPhase::COLLECT_FEEDBACK)
+    {
+        std::string reason;
+
+        const InitSampleCheckResult check_result =
+            checkInitialSamples(&reason);
+
+        if (check_result == InitSampleCheckResult::Fatal)
+        {
+            requestFatalShutdown(
+                "[Init] Initial sample validation failed: " +
+                reason);
+
+            return;
+        }
+
+        if (check_result == InitSampleCheckResult::Ready)
+        {
+            start_positions_.resize(all_motors_.size());
+
+            for (size_t i = 0;
+                i < all_motors_.size();
+                ++i)
+            {
+                const float median_position =
+                    computeMedian(
+                        init_position_samples_[i]);
+
+                // 중앙값 자체도 마지막으로 다시 검사
+                if (!std::isfinite(median_position) ||
+                    std::fabs(median_position) >
+                        INIT_Q_ABS_LIMIT)
+                {
+                    requestFatalShutdown(
+                        "[Init] Invalid median position: "
+                        "motor=" + std::to_string(i) +
+                        " motor_id=" +
+                        std::to_string(
+                            all_motors_[i]->getMotorId()) +
+                        " median=" +
+                        std::to_string(median_position));
+
+                    return;
+                }
+
+                start_positions_[i] =
+                    median_position;
+
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "[Init] Start position validated: "
+                    "motor=%zu motor_id=%u "
+                    "median=%.6f samples=%zu",
+                    i,
+                    static_cast<unsigned>(
+                        all_motors_[i]->getMotorId()),
+                    median_position,
+                    init_position_samples_[i].size());
+            }
+
+            start_positions_captured_ = true;
+            init_phase_ = InitPhase::WAIT_COMMAND;
+            init_tick_count_ = 0;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[Init] All initial positions validated. "
+                "Waiting for upper command.");
+        }
+        else
+        {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "[Init] Collecting feedback: %s",
+                reason.c_str());
+        }
+
+        const auto elapsed =
+            std::chrono::steady_clock::now() -
+            init_phase_start_time_;
+
+        if (elapsed >
+            std::chrono::milliseconds(
+                INIT_COLLECTION_TIMEOUT_MS))
+        {
+            requestFatalShutdown(
+                "[Init] Initial feedback collection timeout: " +
+                reason);
+
+            return;
+        }
+    }
+
     // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "stabilzation_ : %s, cycle_fali_count : %d", last_read_cycle_all_updated_ ? "true" : "false", cycle_fail_count);
     state_pub->publish(msg);
     transition_to(ControlState::WRITE_PACKET);
@@ -1163,7 +1505,41 @@ void MainControlNode::handle_write_packet()
         std::chrono::milliseconds(200);
     constexpr uint32_t ENOBUFS_FATAL_CYCLES = 5;
 
+    // interpole param 
     float alpha = 0.0f;
+
+    if (init_phase_ == InitPhase::COLLECT_FEEDBACK)
+    {
+        sendZeroCommands();
+
+        transition_to(ControlState::READ_PACKET);
+        return;
+    }
+
+    if (init_phase_ == InitPhase::WAIT_COMMAND)
+    {
+        bool command_ready = false;
+
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            command_ready = packet_initialized_;
+        }
+
+        if (!command_ready)
+        {
+            sendZeroCommands();
+            transition_to(ControlState::READ_PACKET);
+            return;
+        }
+
+        init_tick_count_ = 0;
+        init_phase_ = InitPhase::INTERPOLATING;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "[Init] Upper command already available. "
+            "Starting interpolation.");
+    }
 
     roa_interfaces::msg::MotorCommandArray command_snapshot;
     bool packet_initialized_snapshot = false;
@@ -1181,77 +1557,51 @@ void MainControlNode::handle_write_packet()
 
     if (!packet_initialized_snapshot)
     {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "[Write] No command received yet, skipping write. HINT: check if the command publisher is active and publishing to /hardware_interface/command");
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,
+            "[Write] Waiting for command");
 
         transition_to(ControlState::READ_PACKET);
         return;
     }
 
-    if (!walk_initialized_ && !start_positions_captured_)
-    {
-        std::string reason;
-        if (!isStartPositionReady(&reason))
-        {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[Init] Aborting initialization-write due to invalid start position reason=%s",
-                reason.c_str());
-            transition_to(ControlState::READ_PACKET);
-            return;
-        }
-        // printInitialRawPositionsOnce("before_start_capture");
-        start_positions_.assign(all_motors_.size(), 0.0f);
+    // roa_interfaces::msg::MotorCommandArray command_snapshot;
+    // bool packet_initialized_snapshot = false;
 
-        // // todo 추후 삭제 
-        // return;
+    // {
+    //     std::lock_guard<std::mutex> lock(command_mutex_);
 
-        for (size_t i = 0; i < all_motors_.size(); ++i)
-        {
-            const float pos = last_valid_motor_pos_[i];
+    //     packet_initialized_snapshot = packet_initialized_;
 
-            if (!std::isfinite(pos) || std::fabs(pos) > INIT_Q_ABS_LIMIT)
-            {
-                RCLCPP_ERROR(this->get_logger(),
-                    "[Init] Final capture rejected. motor=%zu pos=%.6f",
-                    i,
-                    pos);
+    //     if (packet_initialized_snapshot)
+    //     {
+    //         command_snapshot = packet_commands_;
+    //     }
+    // }
 
-                start_positions_.clear();
-                start_positions_captured_ = false;
+    // if (!packet_initialized_snapshot)
+    // {
+    //     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+    //         "[Write] No command received yet, skipping write. HINT: check if the command publisher is active and publishing to /hardware_interface/command");
 
-                transition_to(ControlState::READ_PACKET);
-                return;
-            }
+    //     transition_to(ControlState::READ_PACKET);
+    //     return;
+    // }
 
-            start_positions_[i] = pos;
-
-            RCLCPP_INFO(this->get_logger(),
-                "[Init] Captured Motor %zu at position %.6f",
-                i,
-                start_positions_[i]);
-        }
-
-        start_positions_captured_ = true;
-        init_tick_count_ = 0;
-
-        RCLCPP_INFO(this->get_logger(),
-            "[Init] Captured validated start positions for %zu motors",
-            all_motors_.size());
-
-        transition_to(ControlState::READ_PACKET);
-        return;
-    }
-    else if (!walk_initialized_)
+    if (init_phase_ == InitPhase::INTERPOLATING)
     {
         ++init_tick_count_;
 
-        alpha = static_cast<float>(init_tick_count_) /
-                static_cast<float>(INIT_TOTAL_TICKS);
+        alpha =
+            static_cast<float>(init_tick_count_) /
+            static_cast<float>(INIT_TOTAL_TICKS);
 
-        if (alpha > 1.0f)
-        {
-            alpha = 1.0f;
-        }
+        alpha = std::clamp(
+            alpha,
+            0.0f,
+            1.0f);
     }
 
     for (auto& group : can_groups_)
@@ -1278,7 +1628,7 @@ void MainControlNode::handle_write_packet()
 
             float command_pos = wrapToPi(cmd.position);
 
-            if (!walk_initialized_)
+            if (init_phase_ == InitPhase::INTERPOLATING)
             {
                 const float start_raw = start_positions_[packet_index];
                 float diff = command_pos - wrapToPi(start_raw);
@@ -1305,7 +1655,7 @@ void MainControlNode::handle_write_packet()
                 //     command_pos,
                 //     alpha);
             }
-            else
+            else if (init_phase_ == InitPhase::RUNNING)
             {
                 const float raw_pos =
                     static_cast<float>(all_motors_[packet_index]->getPosition());
@@ -1537,9 +1887,11 @@ void MainControlNode::handle_write_packet()
         }
     }
 
-    if (!walk_initialized_ && alpha >= 1.0f)
+    if (init_phase_ == InitPhase::INTERPOLATING && alpha >= 1.0f)
     {
+        init_phase_ = InitPhase::RUNNING;
         walk_initialized_ = true;
+        // publishWalkInitialized(true);
 
         RCLCPP_INFO(this->get_logger(),
             "[Init] initialization interpolation completed after %d ticks",
@@ -1550,47 +1902,62 @@ void MainControlNode::handle_write_packet()
     transition_to(ControlState::READ_PACKET);
 }
 
-void MainControlNode::walkCallback(const roa_interfaces::msg::MotorCommandArray::SharedPtr msg)
+void MainControlNode::publishWalkInitialized(bool initialized)
 {
-    std_msgs::msg::Bool init_msg;
-    init_msg.data = walk_initialized_;
-    initial_pub->publish(init_msg);
+    std_msgs::msg::Bool msg;
+    msg.data = initialized;
 
-    std::lock_guard<std::mutex> lock(command_mutex_);
+    initial_pub->publish(msg);
+}
 
-    packet_commands_.header = msg->header;
+void MainControlNode::walkCallback(
+    const roa_interfaces::msg::MotorCommandArray::SharedPtr msg)
+{
 
-    for (const auto& cmd : msg->commands)
+    publishWalkInitialized(walk_initialized_);
     {
-        const auto it = motor_id_to_index_.find(cmd.motor_id);
-        if (it == motor_id_to_index_.end())
+        std::lock_guard<std::mutex> lock(command_mutex_);
+
+        packet_commands_.header = msg->header;
+
+        for (const auto& cmd : msg->commands)
         {
-            RCLCPP_ERROR(this->get_logger(),
-                "[ros_sub] Unknown motor_id: %u", cmd.motor_id);
-            continue;
+            const auto it =
+                motor_id_to_index_.find(
+                    cmd.motor_id);
+
+            if (it ==
+                motor_id_to_index_.end())
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[ros_sub] Unknown motor_id: %u",
+                    cmd.motor_id);
+
+                continue;
+            }
+
+            const size_t packet_index =
+                it->second;
+
+            packet_commands_.commands[
+                packet_index] = cmd;
         }
 
-        const size_t packet_index = it->second;
-        packet_commands_.commands[packet_index] = cmd;
-
-        // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-        //     "[Walk Callback] bus=%s motor_id=%u -> packet_index=%zu | pos=%.3f vel=%.3f kp=%.3f kd=%.3f tq=%.3f",
-        //     packet_index_to_bus_[packet_index].c_str(),
-        //     cmd.motor_id,
-        //     packet_index,
-        //     cmd.position,
-        //     cmd.velocity,
-        //     cmd.kp,
-        //     cmd.kd,
-        //     cmd.torque);
+        packet_initialized_ = true;
     }
 
-    if (!packet_initialized_)
+    if (init_phase_ == InitPhase::WAIT_COMMAND &&
+        start_positions_captured_)
     {
-        RCLCPP_INFO(this->get_logger(), "[ros_sub] First valid command received");
-    }
+        init_tick_count_ = 0;
+        init_phase_ = InitPhase::INTERPOLATING;
 
-    packet_initialized_ = true;
+        RCLCPP_INFO(
+            this->get_logger(),
+            "[Init] First upper command received. "
+            "Starting interpolation.");
+    }
 }
 
 void MainControlNode::torqueCallback(const std_msgs::msg::Bool::SharedPtr msg)
