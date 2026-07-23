@@ -4,7 +4,7 @@ set -euo pipefail
 BITRATE="${1:-1000000}"
 TXQLEN="${2:-4096}"
 
-INTERFACES=("can_right_leg" "can_left_leg")
+INTERFACES=("can_right_leg" "can_left_leg" "can_right_arm" "can_left_arm")
 
 for ifname in "${INTERFACES[@]}"; do
     echo "[CAN_SETUP] configuring ${ifname}"
