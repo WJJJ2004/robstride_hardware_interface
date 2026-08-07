@@ -2,6 +2,7 @@ hardware_interface_node:
   ros__parameters:
     can_interfaces: ["can_right_leg", "can_left_leg", "can_right_arm", "can_left_arm"]
     baud_rate: 1000000
+    control_frequency_hz: 150.0
 
     can_right_leg:
       motor_ids: [9, 11, 13, 15, 17, 19, 21]
