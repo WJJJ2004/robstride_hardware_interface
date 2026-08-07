@@ -12,8 +12,10 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(roa_interfaces REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(${PROJECT_NAME}_lib
+  src/CanBusWorker.cpp
   src/CanTransport.cpp
   src/RobStrideProtocol.cpp
   src/RobStrideMotor.cpp
@@ -28,6 +30,8 @@ target_include_directories(${PROJECT_NAME}_lib PUBLIC
 ament_target_dependencies(${PROJECT_NAME}_lib
   rclcpp
 )
+
+target_link_libraries(${PROJECT_NAME}_lib Threads::Threads)
 
 add_executable(hardware_interface_node
   src/MainControl.cpp

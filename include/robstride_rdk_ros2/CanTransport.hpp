@@ -23,6 +23,8 @@ public:
     bool isOpen() const { return socket_fd_ >= 0; }
 
 private:
+    void closeUnlocked();
+
     int socket_fd_ = -1;
     std::string interface_name_;
     std::mutex mutex_;

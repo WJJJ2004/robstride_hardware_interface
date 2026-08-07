@@ -36,8 +36,9 @@ uint16_t RobStrideProtocol::floatToUint(float x, float x_min, float x_max, int b
 }
 
 std::vector<uint8_t> RobStrideProtocol::createMotionCommand(
-    float p_des, float v_des, float kp, float kd, float t_ff,
-    float p_min, float p_max, float v_min, float v_max, float kp_max, float kd_max, float t_max)
+    float p_des, float v_des, float kp, float kd, float /* t_ff */,
+    float p_min, float p_max, float v_min, float v_max, float kp_max, float kd_max,
+    float /* t_max */)
 {
     std::vector<uint8_t> data(8);
 
@@ -70,7 +71,7 @@ std::vector<uint8_t> RobStrideProtocol::createDisableCommand()
 
 std::tuple<float, float, float, float ,float> RobStrideProtocol::parseFeedback(
     const std::vector<uint8_t>& data,
-    float p_min, float p_max, float v_min, float v_max, float t_max)
+    float /* p_min */, float p_max, float /* v_min */, float v_max, float t_max)
 {
     if (data.size() < 8) return {0,0,0,0,0};
     uint16_t p_int = (data[0] << 8) | data[1];

@@ -9,6 +9,8 @@
 #include "lifecycle_msgs/msg/transition.hpp"
 #include "RobStrideMotor.hpp"
 #include "CanTransport.hpp"
+#include "CanBusWorker.hpp"
+#include "HardwareData.hpp"
 #include "filter.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -44,15 +46,6 @@ enum class ControlState
     READ_PACKET
 };
 
-enum class WriteResult
-{
-    Ok,
-    TryAgain,
-    NoBuffer,
-    BusDown,
-    IoError,
-    InvalidArg
-};
 enum class InitSampleCheckResult
 {
     Collecting,  // 아직 샘플이 부족함
@@ -60,54 +53,13 @@ enum class InitSampleCheckResult
     Fatal        // 샘플은 충분하지만 비정상 상태
 };
 
-struct BusWriteStats
-{
-    uint32_t ok_writes{0};
-    uint32_t fail_writes{0};
-
-    uint32_t eagain_count{0};
-    uint32_t enobufs_count{0};
-
-    uint32_t consecutive_eagain_cycles{0};
-    uint32_t consecutive_enobufs_cycles{0};
-
-    bool eagain_active{false};
-
-    std::chrono::steady_clock::time_point
-        first_eagain_time{};
-
-    bool cooldown{false};
-    rclcpp::Time cooldown_until{
-        0,
-        0,
-        RCL_ROS_TIME
-    };
-};
-// struct BusWriteStats
-// {
-//     uint32_t ok_writes = 0;
-//     uint32_t fail_writes = 0;
-//     uint32_t enobufs_count = 0;
-//     uint32_t consecutive_enobufs = 0;
-
-//     bool cooldown = false;
-//     rclcpp::Time cooldown_until{0, 0, RCL_ROS_TIME};
-// };
-
-struct MotorWriteStats
-{
-    uint32_t consecutive_failures = 0;
-    WriteResult last_result = WriteResult::Ok;
-};
-
 struct CanBusGroup
 {
     std::string interface_name;
     std::shared_ptr<CanTransport> transport;
     std::vector<std::shared_ptr<RobStrideMotor>> motors;
-
-    BusWriteStats write_stats;
     std::vector<size_t> global_packet_indices;
+    std::shared_ptr<CanBusWorker> worker;
 };
 
 class MainControlNode : public rclcpp_lifecycle::LifecycleNode
@@ -122,6 +74,15 @@ public:
     rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
     on_activate(const rclcpp_lifecycle::State &);
 
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_deactivate(const rclcpp_lifecycle::State &);
+
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_cleanup(const rclcpp_lifecycle::State &);
+
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_shutdown(const rclcpp_lifecycle::State &);
+
 private:
     void publishWalkInitialized(bool initialized);
     void flushCanRxQueues(const char* tag);
@@ -133,6 +94,8 @@ private:
     void handle_write_packet();
     void transition_to(ControlState new_state);
     void initParameters();
+    bool updateControlLoopPeriod();
+    void startControlLoopTimer();
 
     // NOTE: use can-setup.sh to set up CAN interfaces before running. This function is a placeholder if we want to do dynamic setup in the future.
     // bool canSetup(); 
@@ -140,24 +103,25 @@ private:
 
     std::string execute_command(const std::string& cmd);
 
-    WriteResult safeSendCommand(
-        RobStrideMotor& motor,
-        float torque,
-        float position,
-        float velocity,
-        float kp,
-        float kd);
-
-    const char* toString(WriteResult result) const;
     float computeWrappedCommand(float current_raw_pos, float target_wrapped_pos) const;
     void resetRuntimeStates();
     void logWriteSummaryThrottle();
+    bool startWorkers();
+    void stopWorkers();
+    bool waitForWorkerOperations(
+        const std::vector<uint64_t>& generations,
+        std::chrono::microseconds timeout,
+        const char* operation);
     // bool isStartPositionReady(std::string* reason);
 
     std::vector<CanBusGroup> can_groups_;
     std::vector<std::shared_ptr<RobStrideMotor>> all_motors_;
+    std::vector<uint16_t> motor_ids_;
+    std::vector<MotorStateData> latest_motor_states_;
 
     rclcpp::TimerBase::SharedPtr timer_;
+    double control_frequency_hz_{150.0};
+    std::chrono::nanoseconds control_loop_period_{std::chrono::nanoseconds(3333333)};
     rclcpp::Subscription<roa_interfaces::msg::MotorCommandArray>::SharedPtr walk_sub;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr torque_sub;
     rclcpp::Publisher<roa_interfaces::msg::MotorStateArray>::SharedPtr state_pub;
@@ -166,10 +130,9 @@ private:
     ControlState current_state{ControlState::READ_PACKET};
 
     std::vector<std::string> packet_index_to_bus_;
-    std::vector<MotorWriteStats> motor_write_stats_;
 
-    rclcpp::Duration bus_write_cooldown_{0, 50 * 1000 * 1000}; // 50ms
-    uint32_t enobufs_cooldown_threshold_ = 5;
+    static constexpr auto WORKER_COMPLETION_TIMEOUT =
+        std::chrono::microseconds(2500);
 
     std::mutex command_mutex_;
 
@@ -190,6 +153,7 @@ private:
 
     roa_interfaces::msg::MotorCommandArray packet_commands_;
     bool packet_initialized_{false};
+    bool torque_enabled_{false};
 
     // ===== Init start position validation =====
     static constexpr float INIT_Q_ABS_LIMIT =
@@ -202,17 +166,7 @@ private:
     // void printInitialRawPositionsOnce(const char* tag);
     bool initial_raw_position_printed_ = false;
 
-    // for initial feedback verification
-    bool verifyInitialMotorFeedback(
-    std::chrono::milliseconds timeout);
-
     void disableAllMotors();
-
-    bool processReceivedFrame(
-        CanBusGroup& group,
-        uint32_t rx_id,
-        const std::vector<uint8_t>& rx_data,
-        const char* phase);
     void requestFatalShutdown(const std::string& reason);
 
 

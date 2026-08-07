@@ -41,7 +41,7 @@ bool CanTransport::open(const std::string& interface_name)
     if (ioctl(socket_fd_, SIOCGIFINDEX, &ifr) < 0)
     {
         perror("Interface index retrieval failed");
-        close();
+        closeUnlocked();
         return false;
     }
 
@@ -54,7 +54,7 @@ bool CanTransport::open(const std::string& interface_name)
     if (bind(socket_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0)
     {
         perror("Socket bind failed");
-        close();
+        closeUnlocked();
         return false;
     }
 
@@ -88,6 +88,11 @@ bool CanTransport::open(const std::string& interface_name)
 void CanTransport::close()
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    closeUnlocked();
+}
+
+void CanTransport::closeUnlocked()
+{
     if (socket_fd_ >= 0)
     {
         ::close(socket_fd_);
