@@ -104,13 +104,13 @@ bool CanTransport::send(
     {
         errno = ENOTCONN;
 
-        std::fprintf(
-            stderr,
-            "[CanTransport::send] Invalid socket: "
-            "fd=%d errno=%d (%s)\n",
-            socket_fd_,
-            errno,
-            std::strerror(errno));
+        // std::fprintf(
+        //     stderr,
+        //     "[CanTransport::send] Invalid socket: "
+        //     "fd=%d errno=%d (%s)\n",
+        //     socket_fd_,
+        //     errno,
+        //     std::strerror(errno));
 
         return false;
     }
@@ -119,13 +119,13 @@ bool CanTransport::send(
     {
         errno = EINVAL;
 
-        std::fprintf(
-            stderr,
-            "[CanTransport::send] Invalid CAN data size: "
-            "size=%zu errno=%d (%s)\n",
-            data.size(),
-            errno,
-            std::strerror(errno));
+        // std::fprintf(
+        //     stderr,
+        //     "[CanTransport::send] Invalid CAN data size: "
+        //     "size=%zu errno=%d (%s)\n",
+        //     data.size(),
+        //     errno,
+        //     std::strerror(errno));
 
         return false;
     }
@@ -154,17 +154,17 @@ bool CanTransport::send(
         // write 직후 errno를 반드시 저장
         const int saved_errno = errno;
 
-        std::fprintf(
-            stderr,
-            "[CanTransport::send] CAN write failed: "
-            "fd=%d can_id=0x%08X dlc=%u "
-            "nbytes=%d errno=%d (%s)\n",
-            socket_fd_,
-            frame.can_id,
-            static_cast<unsigned>(frame.can_dlc),
-            nbytes,
-            saved_errno,
-            std::strerror(saved_errno));
+        // std::fprintf(
+        //     stderr,
+        //     "[CanTransport::send] CAN write failed: "
+        //     "fd=%d can_id=0x%08X dlc=%u "
+        //     "nbytes=%d errno=%d (%s)\n",
+        //     socket_fd_,
+        //     frame.can_id,
+        //     static_cast<unsigned>(frame.can_dlc),
+        //     nbytes,
+        //     saved_errno,
+        //     std::strerror(saved_errno));
 
         // 상위 safeSendCommand()에서도 같은 errno를 확인하도록 복원
         errno = saved_errno;
@@ -175,18 +175,18 @@ bool CanTransport::send(
     // CAN frame은 부분 쓰기가 정상적으로 발생하면 안 됨
     errno = EIO;
 
-    std::fprintf(
-        stderr,
-        "[CanTransport::send] Partial CAN write: "
-        "fd=%d can_id=0x%08X dlc=%u "
-        "nbytes=%d expected=%zu errno=%d (%s)\n",
-        socket_fd_,
-        frame.can_id,
-        static_cast<unsigned>(frame.can_dlc),
-        nbytes,
-        sizeof(frame),
-        errno,
-        std::strerror(errno));
+    // std::fprintf(
+    //     stderr,
+    //     "[CanTransport::send] Partial CAN write: "
+    //     "fd=%d can_id=0x%08X dlc=%u "
+    //     "nbytes=%d expected=%zu errno=%d (%s)\n",
+    //     socket_fd_,
+    //     frame.can_id,
+    //     static_cast<unsigned>(frame.can_dlc),
+    //     nbytes,
+    //     sizeof(frame),
+    //     errno,
+    //     std::strerror(errno));
 
     return false;
 }

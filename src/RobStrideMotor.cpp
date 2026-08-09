@@ -68,7 +68,7 @@ bool RobStrideMotor::enable()
 
     if (transport_->send(id, data))
     {
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
             rclcpp::get_logger("robstride_motor"),
             "Motor %u Enable Command Sent.",
             static_cast<unsigned>(motor_id_));
@@ -86,7 +86,7 @@ bool RobStrideMotor::disable()
 
     if (transport_->send(id, data))
     {
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
             rclcpp::get_logger("robstride_motor"),
             "Motor %u Disable Command Sent.",
             static_cast<unsigned>(motor_id_));

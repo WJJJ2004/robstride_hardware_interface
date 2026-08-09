@@ -30,6 +30,13 @@
 #include <deque>
 #include <algorithm>
 
+enum class ZeroCommandResult
+{
+    Ok,        // 이번 주기 모든 zero command 송신 성공
+    Deferred,  // 일시적 EAGAIN/ENOBUFS, READ 후 다음 주기에 재시도
+    Fatal      // 복구 불가능하거나 지속된 송신 오류
+};
+
 enum class InitPhase    // WJ: 초기화시 모터 상태 확인
 {
     COLLECT_FEEDBACK,   // Zero Command를 보내며 피드백 수집
@@ -217,7 +224,8 @@ private:
 
 
     // ----------------------------- WJ 초기 피드백 수집 및 상태 확인 -----------------------------
-    bool sendZeroCommands();
+    ZeroCommandResult sendZeroCommands();
+    uint32_t zero_command_deferred_streak_{0};
     InitSampleCheckResult checkInitialSamples(
         std::string* reason) const;
     float computeMedian(const std::deque<float>& samples) const;

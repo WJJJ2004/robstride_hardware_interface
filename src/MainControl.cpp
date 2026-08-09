@@ -221,15 +221,15 @@ bool MainControlNode::processReceivedFrame(
             RCLCPP_INFO(
                 this->get_logger(),
                 "[%s] Motor feedback confirmed: "
-                "bus=%s motor_id=%u packet_index=%zu "
+                "bus=%s motor_id=%u "
                 "q=%.6f qdot=%.6f current=%.6f",
                 phase,
                 group.interface_name.c_str(),
                 static_cast<unsigned>(motor_id),
-                packet_index,
                 q,
                 qdot,
-                current);
+                current
+            );
         }
 
         return true;
@@ -472,7 +472,11 @@ MainControlNode::checkInitialSamples(
             if (reason)
             {
                 *reason =
-                    "motor=" + std::to_string(i) +
+                    "motor_id=" +
+                    std::to_string(
+                        all_motors_[i]->getMotorId()) +
+                    " bus=" +
+                    packet_index_to_bus_[i] +
                     " q_samples=" +
                     std::to_string(q_samples.size()) +
                     " qdot_samples=" +
@@ -597,6 +601,7 @@ void MainControlNode::resetRuntimeStates()
     walk_initialized_ = false;
     start_positions_captured_ = false;
     start_position_init_attempted_ = false;
+    zero_command_deferred_streak_ = 0;
 
     init_tick_count_ = 0;
     start_positions_.clear();
@@ -723,7 +728,7 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
             group.global_packet_indices.push_back(packet_index);
             packet_index_to_bus_.push_back(can_name);
 
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_DEBUG(this->get_logger(),
                 "[Configure] %s Motor[%zu] initialized - ID: %u, Type: %ld",
                 can_name.c_str(), i, id, motor_types[i]);
         }
@@ -747,7 +752,7 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
 
         motor_id_to_index_[id] = i;
 
-        RCLCPP_INFO(this->get_logger(),
+        RCLCPP_DEBUG(this->get_logger(),
             "[Configure] Packet mapper: motor_id=%u -> packet_index=%zu (bus=%s)",
             id, i, packet_index_to_bus_[i].c_str());
     }
@@ -799,7 +804,9 @@ CallbackReturn MainControlNode::on_activate(
         {
             requestFatalShutdown(
                 "[Activate] Enable command TX failed: "
-                "packet_index=" + std::to_string(i));
+                "bus=" + packet_index_to_bus_[i] +
+                " motor_id=" +
+                std::to_string(all_motors_[i]->getMotorId()));
 
             return CallbackReturn::FAILURE;
         }
@@ -825,7 +832,7 @@ CallbackReturn MainControlNode::on_activate(
     current_state = ControlState::WRITE_PACKET;
 
     timer_ = this->create_wall_timer(
-        std::chrono::microseconds(3333),
+        std::chrono::microseconds(5000), // 200 hz 
         std::bind(
             &MainControlNode::control_loop,
             this));
@@ -837,40 +844,82 @@ CallbackReturn MainControlNode::on_activate(
     return CallbackReturn::SUCCESS;
 }
 
-bool MainControlNode::sendZeroCommands()
+ZeroCommandResult MainControlNode::sendZeroCommands()
 {
-    bool all_ok = true;
+    bool deferred = false;
 
     for (auto& group : can_groups_)
     {
-        for (size_t local_idx = 0;
-             local_idx < group.motors.size();
-             ++local_idx)
+        for (auto& motor : group.motors)
         {
-            auto& motor = group.motors[local_idx];
-
             const WriteResult result =
                 safeSendCommand(
                     *motor,
-                    0.0f,  // torque
-                    0.0f,  // position
-                    0.0f,  // velocity
-                    0.0f,  // kp
-                    0.0f); // kd
-            if (result != WriteResult::Ok)
-            {
-                all_ok = false;
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f);
 
-                requestFatalShutdown(
-                    "[Safety] Zero-command TX failed: "
-                    "bus=" + group.interface_name +
-                    " motor_id=" + std::to_string(motor->getMotorId()) +
-                    " reason=" + toString(result));
+            if (result == WriteResult::Ok)
+            {
+                ++group.write_stats.ok_writes;
+                continue;
             }
+
+            ++group.write_stats.fail_writes;
+
+            if (result == WriteResult::TryAgain)
+            {
+                ++group.write_stats.eagain_count;
+                deferred = true;
+
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "[InitWrite] EAGAIN: "
+                    "bus=%s motor_id=%u",
+                    group.interface_name.c_str(),
+                    static_cast<unsigned>(
+                        motor->getMotorId()));
+
+                // 같은 버스의 나머지 송신 생략
+                break;
+            }
+
+            if (result == WriteResult::NoBuffer)
+            {
+                ++group.write_stats.enobufs_count;
+                deferred = true;
+
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "[InitWrite] ENOBUFS: "
+                    "bus=%s motor_id=%u",
+                    group.interface_name.c_str(),
+                    static_cast<unsigned>(
+                        motor->getMotorId()));
+
+                break;
+            }
+
+            requestFatalShutdown(
+                "[Safety] Zero-command TX failed: "
+                "bus=" + group.interface_name +
+                " motor_id=" +
+                std::to_string(motor->getMotorId()) +
+                " reason=" + toString(result));
+
+            return ZeroCommandResult::Fatal;
         }
     }
 
-    return all_ok;
+    return deferred
+        ? ZeroCommandResult::Deferred
+        : ZeroCommandResult::Ok;
 }
 
 void MainControlNode::control_loop()
@@ -1504,13 +1553,59 @@ void MainControlNode::handle_write_packet()
     constexpr auto EAGAIN_FATAL_DURATION =
         std::chrono::milliseconds(200);
     constexpr uint32_t ENOBUFS_FATAL_CYCLES = 5;
+    constexpr uint32_t MAX_ZERO_COMMAND_DEFERRED_CYCLES = 30;
 
     // interpole param 
     float alpha = 0.0f;
 
     if (init_phase_ == InitPhase::COLLECT_FEEDBACK)
     {
-        sendZeroCommands();
+        const ZeroCommandResult result = sendZeroCommands();
+
+        switch (result)
+        {
+            case ZeroCommandResult::Ok:
+            {
+                // 정상 송신 주기가 한 번이라도 나오면
+                // 연속 Deferred 상태 해제
+                zero_command_deferred_streak_ = 0;
+                break;
+            }
+
+            case ZeroCommandResult::Deferred:
+            {
+                ++zero_command_deferred_streak_;
+
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "[InitWrite] Zero command deferred: "
+                    "consecutive_cycles=%u limit=%u",
+                    zero_command_deferred_streak_,
+                    MAX_ZERO_COMMAND_DEFERRED_CYCLES);
+
+                if (zero_command_deferred_streak_ >=
+                    MAX_ZERO_COMMAND_DEFERRED_CYCLES)
+                {
+                    requestFatalShutdown(
+                        "[Safety] Zero-command transmission "
+                        "continuously deferred during initialization: "
+                        "cycles=" +
+                        std::to_string(
+                            zero_command_deferred_streak_));
+
+                    return;
+                }
+
+                break;
+            }
+
+            case ZeroCommandResult::Fatal:
+            {
+                return;
+            }
+        }
 
         transition_to(ControlState::READ_PACKET);
         return;
@@ -1527,7 +1622,34 @@ void MainControlNode::handle_write_packet()
 
         if (!command_ready)
         {
-            sendZeroCommands();
+            const ZeroCommandResult result = sendZeroCommands();
+            
+            if (result == ZeroCommandResult::Ok)
+            {
+                zero_command_deferred_streak_ = 0;
+            }
+            else if (result == ZeroCommandResult::Deferred)
+            {
+                ++zero_command_deferred_streak_;
+
+                if (zero_command_deferred_streak_ >=
+                    MAX_ZERO_COMMAND_DEFERRED_CYCLES)
+                {
+                    requestFatalShutdown(
+                        "[Safety] Zero-command transmission "
+                        "continuously deferred while waiting for command: "
+                        "cycles=" +
+                        std::to_string(
+                            zero_command_deferred_streak_));
+
+                    return;
+                }
+            }
+            else
+            {
+                return;
+            }
+
             transition_to(ControlState::READ_PACKET);
             return;
         }
@@ -1973,7 +2095,7 @@ void MainControlNode::torqueCallback(const std_msgs::msg::Bool::SharedPtr msg)
             ok = all_motors_[i]->enable();
             if (ok)
             {
-                RCLCPP_INFO(this->get_logger(),
+                RCLCPP_DEBUG(this->get_logger(),
                     "[Torque Callback] Motor[%zu] enable command sent", i);
             }
             else
@@ -1990,7 +2112,7 @@ void MainControlNode::torqueCallback(const std_msgs::msg::Bool::SharedPtr msg)
             ok = all_motors_[i]->disable();
             if (ok)
             {
-                RCLCPP_INFO(this->get_logger(),
+                RCLCPP_DEBUG(this->get_logger(),
                     "[Torque Callback] Motor[%zu] disabled successfully", i);
             }
             else
