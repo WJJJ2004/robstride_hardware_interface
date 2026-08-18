@@ -20,8 +20,20 @@ uint8_t RobStrideProtocol::getMotorIdFromCanId(uint32_t can_id)
 
 uint8_t RobStrideProtocol::getTypeFromCanId(uint32_t can_id)
 {
-    // Type은 bits 24-31
-    return static_cast<uint8_t>((can_id >> 24) & 0xFF);
+    // SocketCAN flags live above the 29-bit extended ID. Communication type
+    // occupies only bits 24-28, so neither CAN_EFF_FLAG nor status bits may
+    // participate in the comparison.
+    return static_cast<uint8_t>((can_id >> 24) & 0x1F);
+}
+
+uint8_t RobStrideProtocol::getRunStateFromCanId(uint32_t can_id)
+{
+    return static_cast<uint8_t>((can_id >> 22) & 0x03);
+}
+
+uint8_t RobStrideProtocol::getFaultFlagsFromCanId(uint32_t can_id)
+{
+    return static_cast<uint8_t>((can_id >> 16) & 0x3F);
 }
 
 uint16_t RobStrideProtocol::floatToUint(float x, float x_min, float x_max, int bits)

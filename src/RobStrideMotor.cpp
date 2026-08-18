@@ -178,5 +178,19 @@ void RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& r
     temperature_ = temp;
     current_ = c;
 
+    // Only Type-2 feedback defines run-state/fault fields in the extended
+    // identifier. Type-1 frames may carry motion feedback but must never be
+    // accepted as an Enable confirmation.
+    if (type == ProtocolCmd::MOTOR_REQUEST)
+    {
+        fault_flags_.store(
+            RobStrideProtocol::getFaultFlagsFromCanId(rx_id),
+            std::memory_order_release);
+        run_state_.store(
+            RobStrideProtocol::getRunStateFromCanId(rx_id),
+            std::memory_order_release);
+        feedback_sequence_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
     // return true;
 }

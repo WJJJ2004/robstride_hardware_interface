@@ -437,6 +437,9 @@ BusStateData CanBusWorker::performRead()
         state.position = position;
         state.velocity = velocity;
         state.current = current;
+        state.run_state = motor->getRunState();
+        state.fault_flags = motor->getFaultFlags();
+        state.feedback_sequence = motor->getFeedbackSequence();
 
         state.updated = true;
         state.valid = valid;

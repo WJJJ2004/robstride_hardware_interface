@@ -26,6 +26,10 @@ public:
     // 통신 타입 추출
     static uint8_t getTypeFromCanId(uint32_t can_id);
 
+    // Type-2 motor feedback status fields carried in the extended CAN ID.
+    static uint8_t getRunStateFromCanId(uint32_t can_id);
+    static uint8_t getFaultFlagsFromCanId(uint32_t can_id);
+
     // Float <-> Uint 변환 (SDK 핵심 로직)
     static uint16_t floatToUint(float x, float x_min, float x_max, int bits);
 

@@ -6,6 +6,7 @@
 #include "CanTransport.hpp"
 #include "RobStrideProtocol.hpp"
 #include <memory>
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -40,6 +41,9 @@ public:
     float getTorque() const { return torque_; }
     float getTemperature() const { return temperature_; }
     float getCurrent() const { return current_; }
+    uint8_t getRunState() const { return run_state_.load(std::memory_order_acquire); }
+    uint8_t getFaultFlags() const { return fault_flags_.load(std::memory_order_acquire); }
+    uint64_t getFeedbackSequence() const { return feedback_sequence_.load(std::memory_order_acquire); }
 
 private:
     std::shared_ptr<CanTransport> transport_;
@@ -54,6 +58,9 @@ private:
     float torque_ = 0.0f;
     float temperature_ = 0.0f;
     float current_ = 0.0f;
+    std::atomic<uint8_t> run_state_{0};
+    std::atomic<uint8_t> fault_flags_{0};
+    std::atomic<uint64_t> feedback_sequence_{0};
 
     void loadLimits();
     float getVelocityFeedbackScale() const;

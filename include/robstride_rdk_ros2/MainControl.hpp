@@ -108,6 +108,8 @@ private:
     void logWriteSummaryThrottle();
     bool startWorkers();
     void stopWorkers();
+    bool confirmMotorEnableStates(
+        const std::vector<uint64_t>& baseline_sequences);
     bool waitForWorkerOperations(
         const std::vector<uint64_t>& generations,
         std::chrono::microseconds timeout,
@@ -133,6 +135,11 @@ private:
 
     static constexpr auto WORKER_COMPLETION_TIMEOUT =
         std::chrono::microseconds(2500);
+    static constexpr auto ENABLE_CONFIRMATION_TIMEOUT =
+        std::chrono::milliseconds(2000);
+    static constexpr auto ENABLE_RESEND_INTERVAL =
+        std::chrono::milliseconds(200);
+    static constexpr uint8_t MOTOR_RUN_STATE = 2;
 
     std::mutex command_mutex_;
 

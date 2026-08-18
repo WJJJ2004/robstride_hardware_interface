@@ -35,6 +35,9 @@ struct MotorStateData
     float position{0.0f};
     float velocity{0.0f};
     float current{0.0f};
+    uint8_t run_state{0};
+    uint8_t fault_flags{0};
+    uint64_t feedback_sequence{0};
     bool updated{false};
     bool valid{false};
     std::chrono::steady_clock::time_point feedback_time{};

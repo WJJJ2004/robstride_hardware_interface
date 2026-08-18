@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <thread>
 
 static float wrapToPi(float angle)
 {
@@ -569,6 +570,22 @@ CallbackReturn MainControlNode::on_activate(
     resetRuntimeStates();
     flushCanRxQueues("before_enable");
 
+    // Start RX workers before Enable so a fast Type-2 confirmation cannot be
+    // left unread or mistaken for an old feedback frame.
+    if (!startWorkers())
+    {
+        disableAllMotors();
+        return CallbackReturn::FAILURE;
+    }
+
+    std::vector<uint64_t> enable_baselines;
+    enable_baselines.reserve(all_motors_.size());
+    for (const auto& motor : all_motors_)
+    {
+        enable_baselines.push_back(
+            motor ? motor->getFeedbackSequence() : 0);
+    }
+
     for (size_t i = 0; i < all_motors_.size(); ++i)
     {
         if (!all_motors_[i]->enable())
@@ -581,9 +598,10 @@ CallbackReturn MainControlNode::on_activate(
         }
     }
 
-    if (!startWorkers())
+    if (!confirmMotorEnableStates(enable_baselines))
     {
-        disableAllMotors();
+        requestFatalShutdown(
+            "[Activate] One or more motors did not confirm enabled state");
         return CallbackReturn::FAILURE;
     }
     torque_enabled_ = true;
@@ -672,6 +690,141 @@ void MainControlNode::stopWorkers()
             group.worker->stop();
         }
     }
+}
+
+bool MainControlNode::confirmMotorEnableStates(
+    const std::vector<uint64_t>& baseline_sequences)
+{
+    if (baseline_sequences.size() != all_motors_.size())
+    {
+        RCLCPP_ERROR(this->get_logger(),
+            "[Activate] Enable baseline size mismatch");
+        return false;
+    }
+
+    std::vector<bool> confirmed(all_motors_.size(), false);
+    std::vector<size_t> attempts(all_motors_.size(), 1);
+    size_t confirmed_count = 0;
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + ENABLE_CONFIRMATION_TIMEOUT;
+    auto next_resend =
+        std::chrono::steady_clock::now() + ENABLE_RESEND_INTERVAL;
+
+    while (confirmed_count < all_motors_.size() &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        std::vector<uint64_t> generations;
+        generations.reserve(can_groups_.size());
+        for (auto& group : can_groups_)
+        {
+            generations.push_back(
+                group.worker ? group.worker->requestRead() : 0);
+        }
+        waitForWorkerOperations(
+            generations, WORKER_COMPLETION_TIMEOUT, "ENABLE_READ");
+
+        for (size_t i = 0; i < all_motors_.size(); ++i)
+        {
+            if (confirmed[i] || !all_motors_[i])
+            {
+                continue;
+            }
+
+            const uint64_t sequence =
+                all_motors_[i]->getFeedbackSequence();
+            if (sequence <= baseline_sequences[i])
+            {
+                continue;
+            }
+
+            const uint8_t fault_flags =
+                all_motors_[i]->getFaultFlags();
+            const uint8_t run_state =
+                all_motors_[i]->getRunState();
+
+            if (fault_flags != 0)
+            {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[Activate] Motor fault while enabling: "
+                    "packet_index=%zu bus=%s motor_id=%u fault=0x%02X run_state=%u",
+                    i,
+                    packet_index_to_bus_[i].c_str(),
+                    static_cast<unsigned>(motor_ids_[i]),
+                    static_cast<unsigned>(fault_flags),
+                    static_cast<unsigned>(run_state));
+                return false;
+            }
+
+            if (run_state == MOTOR_RUN_STATE)
+            {
+                confirmed[i] = true;
+                ++confirmed_count;
+                RCLCPP_INFO(this->get_logger(),
+                    "[Activate] Enable confirmed: "
+                    "packet_index=%zu bus=%s motor_id=%u sequence=%lu attempts=%zu",
+                    i,
+                    packet_index_to_bus_[i].c_str(),
+                    static_cast<unsigned>(motor_ids_[i]),
+                    static_cast<unsigned long>(sequence),
+                    attempts[i]);
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (confirmed_count < all_motors_.size() && now >= next_resend)
+        {
+            for (size_t i = 0; i < all_motors_.size(); ++i)
+            {
+                if (!confirmed[i] && all_motors_[i])
+                {
+                    ++attempts[i];
+                    if (!all_motors_[i]->enable())
+                    {
+                        RCLCPP_WARN(this->get_logger(),
+                            "[Activate] Enable resend TX failed: "
+                            "packet_index=%zu bus=%s motor_id=%u attempt=%zu",
+                            i,
+                            packet_index_to_bus_[i].c_str(),
+                            static_cast<unsigned>(motor_ids_[i]),
+                            attempts[i]);
+                    }
+                }
+            }
+            next_resend += ENABLE_RESEND_INTERVAL;
+        }
+
+        if (confirmed_count < all_motors_.size())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    if (confirmed_count == all_motors_.size())
+    {
+        return true;
+    }
+
+    for (size_t i = 0; i < all_motors_.size(); ++i)
+    {
+        if (confirmed[i] || !all_motors_[i])
+        {
+            continue;
+        }
+        RCLCPP_ERROR(this->get_logger(),
+            "[Activate] Enable confirmation timeout: "
+            "packet_index=%zu bus=%s motor_id=%u baseline=%lu sequence=%lu "
+            "run_state=%u fault=0x%02X attempts=%zu",
+            i,
+            packet_index_to_bus_[i].c_str(),
+            static_cast<unsigned>(motor_ids_[i]),
+            static_cast<unsigned long>(baseline_sequences[i]),
+            static_cast<unsigned long>(all_motors_[i]->getFeedbackSequence()),
+            static_cast<unsigned>(all_motors_[i]->getRunState()),
+            static_cast<unsigned>(all_motors_[i]->getFaultFlags()),
+            attempts[i]);
+    }
+    return false;
 }
 
 bool MainControlNode::waitForWorkerOperations(
@@ -892,8 +1045,34 @@ void MainControlNode::handle_read_packet()
 
             if (state.updated && state.valid)
             {
+                const bool new_status_feedback =
+                    state.feedback_sequence >
+                    latest_motor_states_[index].feedback_sequence;
                 latest_motor_states_[index] = state;
                 current_cycle_updated[index] = true;
+
+                if (torque_enabled_ && new_status_feedback &&
+                    state.fault_flags != 0)
+                {
+                    requestFatalShutdown(
+                        "[Safety] Motor fault feedback: motor_id=" +
+                        std::to_string(state.motor_id) +
+                        " bus=" + packet_index_to_bus_[index] +
+                        " fault=" + std::to_string(state.fault_flags) +
+                        " run_state=" + std::to_string(state.run_state));
+                    return;
+                }
+
+                if (torque_enabled_ && new_status_feedback &&
+                    state.run_state != MOTOR_RUN_STATE)
+                {
+                    requestFatalShutdown(
+                        "[Safety] Motor left enabled state: motor_id=" +
+                        std::to_string(state.motor_id) +
+                        " bus=" + packet_index_to_bus_[index] +
+                        " run_state=" + std::to_string(state.run_state));
+                    return;
+                }
             }
         }
     }
