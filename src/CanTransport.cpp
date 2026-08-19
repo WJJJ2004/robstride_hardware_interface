@@ -28,7 +28,9 @@ bool CanTransport::open(const std::string& interface_name)
     socket_fd_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (socket_fd_ < 0)
     {
-        perror("Socket creation failed");
+        std::fprintf(stderr,
+            "[CanTransport] Socket creation failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
         return false;
     }
 
@@ -40,7 +42,9 @@ bool CanTransport::open(const std::string& interface_name)
     // 복사한 인터페이스 이름으로 인덱스 가져오기
     if (ioctl(socket_fd_, SIOCGIFINDEX, &ifr) < 0)
     {
-        perror("Interface index retrieval failed");
+        std::fprintf(stderr,
+            "[CanTransport] Interface index lookup failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
         closeUnlocked();
         return false;
     }
@@ -53,7 +57,9 @@ bool CanTransport::open(const std::string& interface_name)
 
     if (bind(socket_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0)
     {
-        perror("Socket bind failed");
+        std::fprintf(stderr,
+            "[CanTransport] Socket bind failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
         closeUnlocked();
         return false;
     }
@@ -61,27 +67,36 @@ bool CanTransport::open(const std::string& interface_name)
     int recv_own_msgs = 0;
     if (setsockopt(socket_fd_, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own_msgs, sizeof(recv_own_msgs)) < 0)
     {
-        perror("Failed to set CAN_RAW_RECV_OWN_MSGS");
+        std::fprintf(stderr,
+            "[CanTransport] CAN_RAW_RECV_OWN_MSGS setup failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
     }
 
     int flags = fcntl(socket_fd_, F_GETFL, 0);
     if (flags < 0)
     {
-        perror("fcntl(F_GETFL) failed");
+        std::fprintf(stderr,
+            "[CanTransport] fcntl(F_GETFL) failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
     }
     else if (fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0)
     {
-        perror("fcntl(F_SETFL, O_NONBLOCK) failed");
+        std::fprintf(stderr,
+            "[CanTransport] nonblocking setup failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
     }
 
     // Increase TX buffer to reduce ENOBUFS under high transmission rates
     int sndbuf_size = 1048576; // 1MB
     if (setsockopt(socket_fd_, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size)) < 0)
     {
-        perror("Failed to set SO_SNDBUF");
+        std::fprintf(stderr,
+            "[CanTransport] SO_SNDBUF setup failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
     }
 
-    std::cout << "[CanTransport] Opened " << interface_name << " successfully." << std::endl;
+    std::cout << "[CanTransport] Opened bus=" << interface_name
+              << " successfully." << std::endl;
     return true;
 }
 
@@ -102,8 +117,7 @@ void CanTransport::closeUnlocked()
 
 // NOTE: temporal debug send()
 bool CanTransport::send(
-    uint32_t can_id,
-    const std::vector<uint8_t>& data)
+    const CanTxFrameData& frame_data)
 {
     if (socket_fd_ < 0)
     {
@@ -112,7 +126,10 @@ bool CanTransport::send(
         std::fprintf(
             stderr,
             "[CanTransport::send] Invalid socket: "
-            "fd=%d errno=%d (%s)\n",
+            "bus=%s motor_id=%u operation=%s fd=%d errno=%d (%s)\n",
+            interface_name_.c_str(),
+            static_cast<unsigned>(frame_data.motor_id),
+            frame_data.operation,
             socket_fd_,
             errno,
             std::strerror(errno));
@@ -120,15 +137,18 @@ bool CanTransport::send(
         return false;
     }
 
-    if (data.size() > 8)
+    if (frame_data.data.size() > 8)
     {
         errno = EINVAL;
 
         std::fprintf(
             stderr,
             "[CanTransport::send] Invalid CAN data size: "
-            "size=%zu errno=%d (%s)\n",
-            data.size(),
+            "bus=%s motor_id=%u operation=%s size=%zu errno=%d (%s)\n",
+            interface_name_.c_str(),
+            static_cast<unsigned>(frame_data.motor_id),
+            frame_data.operation,
+            frame_data.data.size(),
             errno,
             std::strerror(errno));
 
@@ -136,13 +156,13 @@ bool CanTransport::send(
     }
 
     struct can_frame frame{};
-    frame.can_id = can_id | CAN_EFF_FLAG;
-    frame.can_dlc = static_cast<uint8_t>(data.size());
+    frame.can_id = frame_data.can_id | CAN_EFF_FLAG;
+    frame.can_dlc = static_cast<uint8_t>(frame_data.data.size());
 
     std::memcpy(
         frame.data,
-        data.data(),
-        data.size());
+        frame_data.data.data(),
+        frame_data.data.size());
 
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -162,8 +182,11 @@ bool CanTransport::send(
         std::fprintf(
             stderr,
             "[CanTransport::send] CAN write failed: "
-            "fd=%d can_id=0x%08X dlc=%u "
+            "bus=%s motor_id=%u operation=%s fd=%d can_id=0x%08X dlc=%u "
             "nbytes=%d errno=%d (%s)\n",
+            interface_name_.c_str(),
+            static_cast<unsigned>(frame_data.motor_id),
+            frame_data.operation,
             socket_fd_,
             frame.can_id,
             static_cast<unsigned>(frame.can_dlc),
@@ -183,8 +206,11 @@ bool CanTransport::send(
     std::fprintf(
         stderr,
         "[CanTransport::send] Partial CAN write: "
-        "fd=%d can_id=0x%08X dlc=%u "
+        "bus=%s motor_id=%u operation=%s fd=%d can_id=0x%08X dlc=%u "
         "nbytes=%d expected=%zu errno=%d (%s)\n",
+        interface_name_.c_str(),
+        static_cast<unsigned>(frame_data.motor_id),
+        frame_data.operation,
         socket_fd_,
         frame.can_id,
         static_cast<unsigned>(frame.can_dlc),
@@ -194,6 +220,74 @@ bool CanTransport::send(
         std::strerror(errno));
 
     return false;
+}
+
+CanBatchSendResult CanTransport::sendBatch(
+    const std::vector<CanTxFrameData>& frames)
+{
+    CanBatchSendResult result;
+    result.requested = frames.size();
+    if (frames.empty())
+    {
+        return result;
+    }
+
+    std::vector<struct can_frame> can_frames(frames.size());
+    std::vector<struct iovec> iovecs(frames.size());
+    std::vector<struct mmsghdr> messages(frames.size());
+
+    for (std::size_t i = 0; i < frames.size(); ++i)
+    {
+        if (frames[i].data.size() > 8)
+        {
+            result.error_number = EINVAL;
+            return result;
+        }
+        can_frames[i].can_id = frames[i].can_id | CAN_EFF_FLAG;
+        can_frames[i].can_dlc =
+            static_cast<uint8_t>(frames[i].data.size());
+        std::memcpy(
+            can_frames[i].data,
+            frames[i].data.data(),
+            frames[i].data.size());
+
+        iovecs[i].iov_base = &can_frames[i];
+        iovecs[i].iov_len = sizeof(struct can_frame);
+        std::memset(&messages[i], 0, sizeof(struct mmsghdr));
+        messages[i].msg_hdr.msg_iov = &iovecs[i];
+        messages[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (socket_fd_ < 0)
+    {
+        result.error_number = ENOTCONN;
+        return result;
+    }
+
+    std::size_t offset = 0;
+    while (offset < messages.size())
+    {
+        const int sent = ::sendmmsg(
+            socket_fd_,
+            messages.data() + offset,
+            static_cast<unsigned int>(messages.size() - offset),
+            MSG_DONTWAIT);
+        if (sent < 0)
+        {
+            result.error_number = errno;
+            break;
+        }
+        if (sent == 0)
+        {
+            result.error_number = EAGAIN;
+            break;
+        }
+        offset += static_cast<std::size_t>(sent);
+    }
+
+    result.queued = offset;
+    return result;
 }
 
 // // Non-blocking send: drops frame on EAGAIN/EWOULDBLOCK/ENOBUFS instead of blocking.
@@ -254,7 +348,9 @@ bool CanTransport::receive(uint32_t& can_id, std::vector<uint8_t>& data, int tim
 
     if (ret < 0)
     {
-        perror("Poll error");
+        std::fprintf(stderr,
+            "[CanTransport] RX poll failed: bus=%s errno=%d (%s)\n",
+            interface_name_.c_str(), errno, std::strerror(errno));
         return false;
     }
     else if (ret == 0)
@@ -274,7 +370,9 @@ bool CanTransport::receive(uint32_t& can_id, std::vector<uint8_t>& data, int tim
             {
                 return false; 
             }
-            perror("Read error");
+            std::fprintf(stderr,
+                "[CanTransport] RX read failed: bus=%s errno=%d (%s)\n",
+                interface_name_.c_str(), errno, std::strerror(errno));
             return false;
         }
 

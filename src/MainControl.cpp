@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
+#include <sstream>
 #include <thread>
 
 static float wrapToPi(float angle)
@@ -52,6 +54,7 @@ void MainControlNode::initParameters()
 {
     declare_parameter("baud_rate", 1000000);
     declare_parameter("control_frequency_hz", 150.0);
+    declare_parameter("initial_interpolation_duration_sec", 1.0);
     declare_parameter<std::vector<std::string>>("can_interfaces", {"can0"});
 
     const auto can_interfaces = get_parameter("can_interfaces").as_string_array();
@@ -66,6 +69,9 @@ void MainControlNode::initParameters()
     RCLCPP_INFO(this->get_logger(), "[Configure] baud_rate: %ld", get_parameter("baud_rate").as_int());
     RCLCPP_INFO(this->get_logger(), "[Configure] control_frequency_hz: %.3f",
         get_parameter("control_frequency_hz").as_double());
+    RCLCPP_INFO(this->get_logger(),
+        "[Configure] initial_interpolation_duration_sec: %.3f",
+        get_parameter("initial_interpolation_duration_sec").as_double());
     RCLCPP_INFO(this->get_logger(), "[Configure] can_interfaces count: %zu", can_interfaces.size());
 
     for (const auto& can_name : can_interfaces)
@@ -87,9 +93,23 @@ bool MainControlNode::updateControlLoopPeriod()
         return false;
     }
 
-    // One complete control cycle consists of one WRITE and one READ callback.
+    initial_interpolation_duration_sec_ =
+        get_parameter("initial_interpolation_duration_sec").as_double();
+    if (!std::isfinite(initial_interpolation_duration_sec_) ||
+        initial_interpolation_duration_sec_ <= 0.0)
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "[Configure] initial_interpolation_duration_sec must be finite "
+            "and greater than 0 (received: %.3f)",
+            initial_interpolation_duration_sec_);
+        return false;
+    }
+
+    // RX is handled continuously by each bus worker. One timer callback now
+    // represents one complete control cycle.
     const double callback_period_ns =
-        1.0e9 / (control_frequency_hz_ * 2.0);
+        1.0e9 / control_frequency_hz_;
     if (callback_period_ns < 1.0)
     {
         RCLCPP_ERROR(
@@ -106,7 +126,7 @@ bool MainControlNode::updateControlLoopPeriod()
         this->get_logger(),
         "[Configure] Control frequency: %.3f Hz, callback frequency: %.3f Hz, timer period: %.3f us",
         control_frequency_hz_,
-        control_frequency_hz_ * 2.0,
+        control_frequency_hz_,
         static_cast<double>(control_loop_period_.count()) / 1000.0);
     return true;
 }
@@ -142,9 +162,11 @@ std::string MainControlNode::execute_command(const std::string& cmd)
 
 void MainControlNode::disableAllMotors()
 {
+    const std::string motor_ids = formatMotorIdList(motor_ids_);
     RCLCPP_WARN(
         this->get_logger(),
-        "[Safety] Sending disable command to all motors");
+        "[Safety] Sending disable command: motor_ids=%s",
+        motor_ids.c_str());
 
     for (size_t i = 0;
          i < all_motors_.size();
@@ -160,13 +182,11 @@ void MainControlNode::disableAllMotors()
             RCLCPP_ERROR(
                 this->get_logger(),
                 "[Safety] Disable command TX failed: "
-                "packet_index=%zu bus=%s motor_id=%u",
-                i,
+                "motor_id=%u bus=%s",
+                static_cast<unsigned>(motor_ids_[i]),
                 i < packet_index_to_bus_.size()
                     ? packet_index_to_bus_[i].c_str()
-                    : "unknown",
-                static_cast<unsigned>(
-                    motor_ids_[i]));
+                    : "unknown");
         }
     }
 }
@@ -199,20 +219,80 @@ float MainControlNode::computeMedian(
          sorted[n / 2]);
 }
 
-InitSampleCheckResult
-MainControlNode::checkInitialSamples(
-    std::string* reason) const
+std::string MainControlNode::formatMotorContext(
+    std::size_t motor_index) const
+{
+    if (motor_index >= motor_ids_.size() ||
+        motor_index >= packet_index_to_bus_.size())
+    {
+        return "motor_id=unknown bus=unknown "
+            "internal_packet_index=" + std::to_string(motor_index);
+    }
+    return "motor_id=" + std::to_string(motor_ids_[motor_index]) +
+        " bus=" + packet_index_to_bus_[motor_index];
+}
+
+std::string MainControlNode::formatMotorIdList(
+    const std::vector<uint16_t>& motor_ids) const
+{
+    std::ostringstream stream;
+    stream << '[';
+    for (std::size_t i = 0; i < motor_ids.size(); ++i)
+    {
+        if (i != 0) stream << ',';
+        stream << motor_ids[i];
+    }
+    stream << ']';
+    return stream.str();
+}
+
+std::vector<uint16_t> MainControlNode::getGroupMotorIds(
+    const CanBusGroup& group) const
+{
+    std::vector<uint16_t> ids;
+    ids.reserve(group.motors.size());
+    for (const auto& motor : group.motors)
+    {
+        if (motor) ids.push_back(motor->getMotorId());
+    }
+    return ids;
+}
+
+std::string MainControlNode::formatInitSampleReport(
+    const InitSampleCheckReport& report) const
+{
+    if (!report.motor_id)
+    {
+        return report.detail;
+    }
+    return "motor_id=" + std::to_string(*report.motor_id) +
+        " bus=" + report.bus + " " + report.detail;
+}
+
+bool MainControlNode::shouldEmitLog(
+    const std::string& key,
+    std::chrono::milliseconds interval)
+{
+    const auto now = std::chrono::steady_clock::now();
+    const auto it = log_throttle_times_.find(key);
+    if (it != log_throttle_times_.end() && now - it->second < interval)
+    {
+        return false;
+    }
+    log_throttle_times_[key] = now;
+    return true;
+}
+
+InitSampleCheckReport MainControlNode::checkInitialSamples() const
 {
     if (init_position_samples_.size() != all_motors_.size() ||
         init_velocity_samples_.size() != all_motors_.size() ||
-        last_feedback_time_.size() != all_motors_.size())
+        last_feedback_time_.size() != all_motors_.size() ||
+        motor_ids_.size() != all_motors_.size() ||
+        packet_index_to_bus_.size() != all_motors_.size())
     {
-        if (reason)
-        {
-            *reason = "initial sample buffer size mismatch";
-        }
-
-        return InitSampleCheckResult::Fatal;
+        return {InitSampleCheckResult::Fatal, std::nullopt, {},
+            "[InternalInvariant] initial sample or motor metadata size mismatch"};
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -229,17 +309,14 @@ MainControlNode::checkInitialSamples(
         if (q_samples.size() < INIT_REQUIRED_SAMPLES ||
             qdot_samples.size() < INIT_REQUIRED_SAMPLES)
         {
-            if (reason)
-            {
-                *reason =
-                    "motor=" + std::to_string(i) +
-                    " q_samples=" +
-                    std::to_string(q_samples.size()) +
-                    " qdot_samples=" +
-                    std::to_string(qdot_samples.size());
-            }
-
-            return InitSampleCheckResult::Collecting;
+            return {
+                InitSampleCheckResult::Collecting,
+                motor_ids_[i],
+                packet_index_to_bus_[i],
+                "q_samples=" + std::to_string(q_samples.size()) +
+                    "/" + std::to_string(INIT_REQUIRED_SAMPLES) +
+                    " qdot_samples=" + std::to_string(qdot_samples.size()) +
+                    "/" + std::to_string(INIT_REQUIRED_SAMPLES)};
         }
 
         const auto feedback_age =
@@ -250,16 +327,10 @@ MainControlNode::checkInitialSamples(
         if (feedback_age.count() >
             INIT_FEEDBACK_STALE_MS)
         {
-            if (reason)
-            {
-                *reason =
-                    "stale feedback: motor=" +
-                    std::to_string(i) +
-                    " age_ms=" +
-                    std::to_string(feedback_age.count());
-            }
-
-            return InitSampleCheckResult::Fatal;
+            return {InitSampleCheckResult::Fatal, motor_ids_[i],
+                packet_index_to_bus_[i],
+                "stale_feedback age_ms=" +
+                    std::to_string(feedback_age.count())};
         }
 
         const auto minmax =
@@ -273,81 +344,44 @@ MainControlNode::checkInitialSamples(
 
         if (!std::isfinite(position_spread))
         {
-            if (reason)
-            {
-                *reason =
-                    "non-finite position spread: motor=" +
-                    std::to_string(i);
-            }
-
-            return InitSampleCheckResult::Fatal;
+            return {InitSampleCheckResult::Fatal, motor_ids_[i],
+                packet_index_to_bus_[i],
+                "non-finite position spread"};
         }
 
         if (position_spread >
             INIT_POSITION_SPREAD_LIMIT)
         {
-            if (reason)
-            {
-                *reason =
-                    "position spread too large: motor=" +
-                    std::to_string(i) +
-                    " motor_id=" +
-                    std::to_string(
-                        motor_ids_[i]) +
-                    " min=" +
-                    std::to_string(q_min) +
-                    " max=" +
-                    std::to_string(q_max) +
-                    " spread=" +
-                    std::to_string(position_spread) +
-                    " limit=" +
-                    std::to_string(
-                        INIT_POSITION_SPREAD_LIMIT);
-            }
-
-            return InitSampleCheckResult::Fatal;
+            return {InitSampleCheckResult::Fatal, motor_ids_[i],
+                packet_index_to_bus_[i],
+                "position_spread_too_large min=" + std::to_string(q_min) +
+                    " max=" + std::to_string(q_max) +
+                    " spread=" + std::to_string(position_spread) +
+                    " limit=" + std::to_string(INIT_POSITION_SPREAD_LIMIT)};
         }
 
         for (const float qdot : qdot_samples)
         {
             if (!std::isfinite(qdot))
             {
-                if (reason)
-                {
-                    *reason =
-                        "non-finite velocity sample: motor=" +
-                        std::to_string(i);
-                }
-
-                return InitSampleCheckResult::Fatal;
+                return {InitSampleCheckResult::Fatal, motor_ids_[i],
+                    packet_index_to_bus_[i],
+                    "non-finite velocity sample"};
             }
 
             if (std::fabs(qdot) >
                 INIT_VELOCITY_LIMIT)
             {
-                if (reason)
-                {
-                    *reason =
-                        "initial velocity too large: motor=" +
-                        std::to_string(i) +
-                        " qdot=" +
+                return {InitSampleCheckResult::Fatal, motor_ids_[i],
+                    packet_index_to_bus_[i],
+                    "initial_velocity_too_large qdot=" +
                         std::to_string(qdot) +
-                        " limit=" +
-                        std::to_string(
-                            INIT_VELOCITY_LIMIT);
-                }
-
-                return InitSampleCheckResult::Fatal;
+                        " limit=" + std::to_string(INIT_VELOCITY_LIMIT)};
             }
         }
     }
 
-    if (reason)
-    {
-        *reason = "ready";
-    }
-
-    return InitSampleCheckResult::Ready;
+    return {InitSampleCheckResult::Ready, std::nullopt, {}, "ready"};
 }
 
 // ------------------------ Lifecycle Callbacks ------------------------
@@ -358,7 +392,8 @@ void MainControlNode::resetRuntimeStates()
     start_positions_captured_ = false;
     start_position_init_attempted_ = false;
 
-    init_tick_count_ = 0;
+    interpolation_cycle_count_ = 0;
+    interpolation_start_time_ = {};
     start_positions_.clear();
     last_read_cycle_all_updated_ = false;
 
@@ -394,6 +429,7 @@ void MainControlNode::resetRuntimeStates()
 
     for (auto& group : can_groups_)
     {
+        group.last_write_summary_log = {};
         if (group.worker)
         {
             group.worker->resetStatistics();
@@ -472,9 +508,10 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
         if (motor_ids.size() != motor_types.size())
         {
             requestFatalShutdown(
-                "[Configure] %s: motor_ids and motor_type size mismatch" +
-                can_name + "'"
-            );
+                "[Configure] motor_ids and motor_type size mismatch: bus=" +
+                can_name + " motor_ids_count=" +
+                std::to_string(motor_ids.size()) + " motor_type_count=" +
+                std::to_string(motor_types.size()));
             // RCLCPP_ERROR(this->get_logger(),
             //     "[Configure] %s: motor_ids and motor_type size mismatch",
             //     can_name.c_str());
@@ -483,6 +520,15 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
 
         for (size_t i = 0; i < motor_ids.size(); ++i)
         {
+            if (motor_types[i] < 0 || motor_types[i] > 6)
+            {
+                requestFatalShutdown(
+                    "[Configure] Unsupported motor_type=" +
+                    std::to_string(motor_types[i]) + " bus=" + can_name +
+                    " motor_id=" + std::to_string(motor_ids[i]) +
+                    "; expected a RobStride model number from 0 through 6");
+                return CallbackReturn::FAILURE;
+            }
             const auto type = static_cast<ActuatorType>(motor_types[i]);
             const auto id = static_cast<uint8_t>(motor_ids[i]);
 
@@ -496,8 +542,8 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
             packet_index_to_bus_.push_back(can_name);
 
             RCLCPP_INFO(this->get_logger(),
-                "[Configure] %s Motor[%zu] initialized - ID: %u, Type: %ld",
-                can_name.c_str(), i, id, motor_types[i]);
+                "[Configure] Motor initialized: motor_id=%u bus=%s type=%ld",
+                id, can_name.c_str(), motor_types[i]);
         }
 
         group.worker = std::make_shared<CanBusWorker>(
@@ -515,9 +561,12 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
 
         if (motor_id_to_index_.find(id) != motor_id_to_index_.end())
         {
+            const size_t previous_index = motor_id_to_index_.at(id);
             requestFatalShutdown(
-                "[Configure] Duplicate motor_id detected: " +
-                std::to_string(id));
+                "[Configure] Duplicate motor_id detected: motor_id=" +
+                std::to_string(id) + " first_bus=" +
+                packet_index_to_bus_[previous_index] + " duplicate_bus=" +
+                packet_index_to_bus_[i]);
             // RCLCPP_ERROR(this->get_logger(),
             //     "[Configure] Duplicate motor_id detected: %u", id);
             return CallbackReturn::FAILURE;
@@ -526,8 +575,8 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
         motor_id_to_index_[id] = i;
 
         RCLCPP_INFO(this->get_logger(),
-            "[Configure] Packet mapper: motor_id=%u -> packet_index=%zu (bus=%s)",
-            id, i, packet_index_to_bus_[i].c_str());
+            "[Configure] Motor mapping registered: motor_id=%u bus=%s",
+            id, packet_index_to_bus_[i].c_str());
     }
 
     packet_commands_.commands.resize(all_motors_.size());
@@ -543,10 +592,16 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
     }
 
     resetRuntimeStates();
+    policy_state_ = SystemPolicyState::ACTIVE;
+    last_safety_disable_time_ = {};
+    tx_degraded_since_.clear();
+    log_throttle_times_.clear();
 
+    const std::string configured_motor_ids = formatMotorIdList(motor_ids_);
     RCLCPP_INFO(this->get_logger(),
-        "[Configure] Configured successfully with %zu CAN interfaces, %zu total motors",
-        can_groups_.size(), all_motors_.size());
+        "[Configure] Configured successfully: motor_ids=%s "
+        "can_interfaces=%zu total_motors=%zu",
+        configured_motor_ids.c_str(), can_groups_.size(), all_motors_.size());
 
     velocity_filters_.clear();
     velocity_filters_.reserve(all_motors_.size());
@@ -568,6 +623,10 @@ CallbackReturn MainControlNode::on_activate(
         "[Activate] Activating...");
 
     resetRuntimeStates();
+    policy_state_ = SystemPolicyState::ACTIVE;
+    last_safety_disable_time_ = {};
+    tx_degraded_since_.clear();
+    log_throttle_times_.clear();
     flushCanRxQueues("before_enable");
 
     // Start RX workers before Enable so a fast Type-2 confirmation cannot be
@@ -576,6 +635,48 @@ CallbackReturn MainControlNode::on_activate(
     {
         disableAllMotors();
         return CallbackReturn::FAILURE;
+    }
+
+    if (!collectInitialFeedbackDisabled())
+    {
+        RCLCPP_ERROR(this->get_logger(),
+            "[Activate] Disabled-state feedback validation failed");
+        sendSafetyDisableBatches();
+        stopWorkers();
+        return CallbackReturn::FAILURE;
+    }
+
+    for (auto& group : can_groups_)
+    {
+        if (!group.worker)
+        {
+            const std::string motor_ids =
+                formatMotorIdList(getGroupMotorIds(group));
+            RCLCPP_ERROR(this->get_logger(),
+                "[Activate] CAN watchdog configuration failed: "
+                "motor_ids=%s bus=%s reason=missing_worker",
+                motor_ids.c_str(), group.interface_name.c_str());
+            sendSafetyDisableBatches();
+            stopWorkers();
+            return CallbackReturn::FAILURE;
+        }
+        const BusSendReport report =
+            group.worker->configureCanWatchdog(MOTOR_CAN_TIMEOUT_RAW);
+        if (report.result != WorkerResult::Success)
+        {
+            const std::string failed_ids =
+                formatMotorIdList(report.failed_motor_ids);
+            RCLCPP_ERROR(this->get_logger(),
+                "[Activate] CAN watchdog configuration TX failed: "
+                "failed_motor_ids=%s bus=%s queued=%zu/%zu errno=%d (%s)",
+                failed_ids.c_str(), group.interface_name.c_str(),
+                report.queued, report.requested, report.error_number,
+                report.error_number != 0
+                    ? std::strerror(report.error_number) : "none");
+            sendSafetyDisableBatches();
+            stopWorkers();
+            return CallbackReturn::FAILURE;
+        }
     }
 
     std::vector<uint64_t> enable_baselines;
@@ -590,18 +691,22 @@ CallbackReturn MainControlNode::on_activate(
     {
         if (!all_motors_[i]->enable())
         {
-            requestFatalShutdown(
-                "[Activate] Enable command TX failed: "
-                "packet_index=" + std::to_string(i));
-
+            RCLCPP_ERROR(this->get_logger(),
+                "[Activate] Enable command TX failed: motor_id=%u bus=%s",
+                static_cast<unsigned>(motor_ids_[i]),
+                packet_index_to_bus_[i].c_str());
+            sendSafetyDisableBatches();
+            stopWorkers();
             return CallbackReturn::FAILURE;
         }
     }
 
     if (!confirmMotorEnableStates(enable_baselines))
     {
-        requestFatalShutdown(
+        RCLCPP_ERROR(this->get_logger(),
             "[Activate] One or more motors did not confirm enabled state");
+        sendSafetyDisableBatches();
+        stopWorkers();
         return CallbackReturn::FAILURE;
     }
     torque_enabled_ = true;
@@ -619,17 +724,14 @@ CallbackReturn MainControlNode::on_activate(
 
     velocity_filter_time_initialized_ = false;
 
-    init_phase_ = InitPhase::COLLECT_FEEDBACK;
-    init_phase_start_time_ =
-        std::chrono::steady_clock::now();
-
-    current_state = ControlState::WRITE_PACKET;
-
     startControlLoopTimer();
 
+    const std::string active_motor_ids = formatMotorIdList(motor_ids_);
     RCLCPP_INFO(
         this->get_logger(),
-        "[Activate] Zero-command feedback collection started");
+        "[Activate] Disabled feedback validated and motors enabled: "
+        "motor_ids=%s; waiting for upper command",
+        active_motor_ids.c_str());
 
     return CallbackReturn::SUCCESS;
 }
@@ -638,8 +740,9 @@ CallbackReturn MainControlNode::on_deactivate(
     const rclcpp_lifecycle::State &)
 {
     timer_.reset();
+    sendSafetyDisableBatches();
     stopWorkers();
-    disableAllMotors();
+    torque_enabled_ = false;
     return CallbackReturn::SUCCESS;
 }
 
@@ -671,9 +774,11 @@ bool MainControlNode::startWorkers()
     {
         if (!group.worker || !group.worker->start())
         {
+            const std::string motor_ids =
+                formatMotorIdList(getGroupMotorIds(group));
             RCLCPP_ERROR(this->get_logger(),
-                "[Worker] Failed to start bus=%s",
-                group.interface_name.c_str());
+                "[Worker] Failed to start: motor_ids=%s bus=%s",
+                motor_ids.c_str(), group.interface_name.c_str());
             stopWorkers();
             return false;
         }
@@ -690,6 +795,140 @@ void MainControlNode::stopWorkers()
             group.worker->stop();
         }
     }
+}
+
+bool MainControlNode::collectInitialFeedbackDisabled()
+{
+    std::vector<uint64_t> last_sequences(all_motors_.size(), 0);
+    for (size_t i = 0; i < all_motors_.size(); ++i)
+    {
+        last_sequences[i] = all_motors_[i]->getFeedbackSequence();
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(INIT_COLLECTION_TIMEOUT_MS);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        for (auto& group : can_groups_)
+        {
+            if (!group.worker)
+            {
+                policy_state_ = SystemPolicyState::DEGRADED;
+                continue;
+            }
+            const BusSendReport report = group.worker->sendDisableAll();
+            if (report.result != WorkerResult::Success)
+            {
+                policy_state_ = SystemPolicyState::DEGRADED;
+                const std::string failed_ids =
+                    formatMotorIdList(report.failed_motor_ids);
+                if (shouldEmitLog(
+                    "disabled_probe:" + group.interface_name,
+                    std::chrono::milliseconds(1000)))
+                {
+                    RCLCPP_WARN(
+                        this->get_logger(),
+                        "[CAN TX] DISABLED_PROBE batch incomplete: "
+                        "failed_motor_ids=%s bus=%s queued=%zu/%zu "
+                        "errno=%d (%s)",
+                        failed_ids.c_str(), group.interface_name.c_str(),
+                        report.queued, report.requested, report.error_number,
+                        report.error_number != 0
+                            ? std::strerror(report.error_number) : "none");
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+        for (auto& group : can_groups_)
+        {
+            if (!group.worker)
+            {
+                continue;
+            }
+            const BusStateData snapshot = group.worker->getStateSnapshot();
+            for (const auto& state : snapshot.states)
+            {
+                const size_t index = state.global_packet_index;
+                if (index >= all_motors_.size() || !state.updated ||
+                    !state.valid ||
+                    state.feedback_sequence <= last_sequences[index])
+                {
+                    continue;
+                }
+                last_sequences[index] = state.feedback_sequence;
+                if (state.fault_flags != 0)
+                {
+                    RCLCPP_ERROR(this->get_logger(),
+                        "[Activate] Fault during disabled probe: "
+                        "motor_id=%u bus=%s fault=0x%02X",
+                        static_cast<unsigned>(motor_ids_[index]),
+                        packet_index_to_bus_[index].c_str(),
+                        static_cast<unsigned>(state.fault_flags));
+                    return false;
+                }
+
+                const bool valid_feedback =
+                    std::isfinite(state.position) &&
+                    std::isfinite(state.velocity) &&
+                    std::isfinite(state.current) &&
+                    std::fabs(state.position) <= INIT_Q_ABS_LIMIT &&
+                    std::fabs(state.velocity) <= INIT_VELOCITY_LIMIT;
+                if (!valid_feedback)
+                {
+                    init_position_samples_[index].clear();
+                    init_velocity_samples_[index].clear();
+                    continue;
+                }
+
+                auto& q = init_position_samples_[index];
+                auto& qdot = init_velocity_samples_[index];
+                q.push_back(state.position);
+                qdot.push_back(state.velocity);
+                if (q.size() > INIT_REQUIRED_SAMPLES) q.pop_front();
+                if (qdot.size() > INIT_REQUIRED_SAMPLES) qdot.pop_front();
+                last_feedback_time_[index] = state.feedback_time;
+            }
+        }
+
+        const InitSampleCheckReport sample_report = checkInitialSamples();
+        if (sample_report.result == InitSampleCheckResult::Fatal)
+        {
+            const std::string detail = formatInitSampleReport(sample_report);
+            RCLCPP_ERROR(this->get_logger(),
+                "[Activate] Disabled feedback invalid: %s", detail.c_str());
+            return false;
+        }
+        if (sample_report.result == InitSampleCheckResult::Ready)
+        {
+            start_positions_.resize(all_motors_.size());
+            for (size_t i = 0; i < all_motors_.size(); ++i)
+            {
+                start_positions_[i] = computeMedian(init_position_samples_[i]);
+                latest_motor_states_[i].position = start_positions_[i];
+                latest_motor_states_[i].feedback_sequence = last_sequences[i];
+                latest_motor_states_[i].feedback_time = last_feedback_time_[i];
+                RCLCPP_INFO(this->get_logger(),
+                    "[Activate] Disabled position validated: "
+                    "motor_id=%u bus=%s median=%.6f samples=%zu",
+                    static_cast<unsigned>(motor_ids_[i]),
+                    packet_index_to_bus_[i].c_str(),
+                    start_positions_[i], init_position_samples_[i].size());
+            }
+            start_positions_captured_ = true;
+            init_phase_ = InitPhase::WAIT_COMMAND;
+            interpolation_cycle_count_ = 0;
+            interpolation_start_time_ = {};
+            return true;
+        }
+    }
+
+    const InitSampleCheckReport sample_report = checkInitialSamples();
+    const std::string detail = formatInitSampleReport(sample_report);
+    RCLCPP_ERROR(this->get_logger(),
+        "[Activate] Disabled feedback collection timeout: %s",
+        detail.c_str());
+    return false;
 }
 
 bool MainControlNode::confirmMotorEnableStates(
@@ -710,20 +949,11 @@ bool MainControlNode::confirmMotorEnableStates(
         std::chrono::steady_clock::now() + ENABLE_CONFIRMATION_TIMEOUT;
     auto next_resend =
         std::chrono::steady_clock::now() + ENABLE_RESEND_INTERVAL;
+    auto next_keepalive = std::chrono::steady_clock::now();
 
     while (confirmed_count < all_motors_.size() &&
            std::chrono::steady_clock::now() < deadline)
     {
-        std::vector<uint64_t> generations;
-        generations.reserve(can_groups_.size());
-        for (auto& group : can_groups_)
-        {
-            generations.push_back(
-                group.worker ? group.worker->requestRead() : 0);
-        }
-        waitForWorkerOperations(
-            generations, WORKER_COMPLETION_TIMEOUT, "ENABLE_READ");
-
         for (size_t i = 0; i < all_motors_.size(); ++i)
         {
             if (confirmed[i] || !all_motors_[i])
@@ -747,10 +977,9 @@ bool MainControlNode::confirmMotorEnableStates(
             {
                 RCLCPP_ERROR(this->get_logger(),
                     "[Activate] Motor fault while enabling: "
-                    "packet_index=%zu bus=%s motor_id=%u fault=0x%02X run_state=%u",
-                    i,
-                    packet_index_to_bus_[i].c_str(),
+                    "motor_id=%u bus=%s fault=0x%02X run_state=%u",
                     static_cast<unsigned>(motor_ids_[i]),
+                    packet_index_to_bus_[i].c_str(),
                     static_cast<unsigned>(fault_flags),
                     static_cast<unsigned>(run_state));
                 return false;
@@ -762,16 +991,23 @@ bool MainControlNode::confirmMotorEnableStates(
                 ++confirmed_count;
                 RCLCPP_INFO(this->get_logger(),
                     "[Activate] Enable confirmed: "
-                    "packet_index=%zu bus=%s motor_id=%u sequence=%lu attempts=%zu",
-                    i,
-                    packet_index_to_bus_[i].c_str(),
+                    "motor_id=%u bus=%s sequence=%lu attempts=%zu",
                     static_cast<unsigned>(motor_ids_[i]),
+                    packet_index_to_bus_[i].c_str(),
                     static_cast<unsigned long>(sequence),
                     attempts[i]);
             }
         }
 
         const auto now = std::chrono::steady_clock::now();
+        if (now >= next_keepalive)
+        {
+            // CAN_TIMEOUT is already armed. A zero-gain motion frame keeps
+            // confirmed motors alive without producing torque while slower
+            // motors are still completing their Enable handshake.
+            sendZeroCommands();
+            next_keepalive = now + std::chrono::milliseconds(10);
+        }
         if (confirmed_count < all_motors_.size() && now >= next_resend)
         {
             for (size_t i = 0; i < all_motors_.size(); ++i)
@@ -783,10 +1019,9 @@ bool MainControlNode::confirmMotorEnableStates(
                     {
                         RCLCPP_WARN(this->get_logger(),
                             "[Activate] Enable resend TX failed: "
-                            "packet_index=%zu bus=%s motor_id=%u attempt=%zu",
-                            i,
-                            packet_index_to_bus_[i].c_str(),
+                            "motor_id=%u bus=%s attempt=%zu",
                             static_cast<unsigned>(motor_ids_[i]),
+                            packet_index_to_bus_[i].c_str(),
                             attempts[i]);
                     }
                 }
@@ -813,11 +1048,10 @@ bool MainControlNode::confirmMotorEnableStates(
         }
         RCLCPP_ERROR(this->get_logger(),
             "[Activate] Enable confirmation timeout: "
-            "packet_index=%zu bus=%s motor_id=%u baseline=%lu sequence=%lu "
+            "motor_id=%u bus=%s baseline=%lu sequence=%lu "
             "run_state=%u fault=0x%02X attempts=%zu",
-            i,
-            packet_index_to_bus_[i].c_str(),
             static_cast<unsigned>(motor_ids_[i]),
+            packet_index_to_bus_[i].c_str(),
             static_cast<unsigned long>(baseline_sequences[i]),
             static_cast<unsigned long>(all_motors_[i]->getFeedbackSequence()),
             static_cast<unsigned>(all_motors_[i]->getRunState()),
@@ -825,34 +1059,6 @@ bool MainControlNode::confirmMotorEnableStates(
             attempts[i]);
     }
     return false;
-}
-
-bool MainControlNode::waitForWorkerOperations(
-    const std::vector<uint64_t>& generations,
-    std::chrono::microseconds timeout,
-    const char* operation)
-{
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    bool all_completed = true;
-
-    for (size_t i = 0; i < can_groups_.size(); ++i)
-    {
-        const auto now = std::chrono::steady_clock::now();
-        const auto remaining = now < deadline
-            ? std::chrono::duration_cast<std::chrono::microseconds>(deadline - now)
-            : std::chrono::microseconds(0);
-
-        if (i >= generations.size() || generations[i] == 0 ||
-            !can_groups_[i].worker->waitUntilCompleted(generations[i], remaining))
-        {
-            all_completed = false;
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[Worker] %s completion timeout: bus=%s",
-                operation, can_groups_[i].interface_name.c_str());
-        }
-    }
-
-    return all_completed;
 }
 
 bool MainControlNode::sendZeroCommands()
@@ -868,74 +1074,30 @@ bool MainControlNode::sendZeroCommands()
                 motor_ids_[group.global_packet_indices[local_idx]];
             command.commands.push_back(motor_command);
         }
+        BusSendReport report;
         if (group.worker)
         {
-            group.worker->setCommandData(command);
+            report = group.worker->sendCommandData(command);
         }
-    }
-
-    std::vector<uint64_t> generations;
-    generations.reserve(can_groups_.size());
-    for (auto& group : can_groups_)
-    {
-        generations.push_back(group.worker ? group.worker->requestWrite() : 0);
-    }
-
-    const bool completed = waitForWorkerOperations(
-        generations, WORKER_COMPLETION_TIMEOUT, "ZERO_WRITE");
-    if (!completed)
-    {
-        requestFatalShutdown("[Safety] Zero-command worker timeout");
-        return false;
-    }
-
-    for (auto& group : can_groups_)
-    {
-        if (!group.worker ||
-            group.worker->getStatusSnapshot().last_result != WorkerResult::Success)
+        else
         {
-            requestFatalShutdown(
-                "[Safety] Zero-command TX failed: bus=" + group.interface_name);
-            return false;
+            report.result = WorkerResult::BusUnavailable;
+            report.requested = group.motors.size();
+            report.error_number = ENOTCONN;
+            for (const auto& motor : group.motors)
+            {
+                if (motor) report.failed_motor_ids.push_back(motor->getMotorId());
+            }
         }
+        handleBusSendResult(group.interface_name, report, "ZERO");
     }
     return true;
 }
 
 void MainControlNode::control_loop()
 {
-    // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-    // "[Loop] current_state=%s",
-    // (current_state == ControlState::READ_PACKET ? "READ" : "WRITE"));
-
-    static auto last_print_time = std::chrono::steady_clock::now();
-    static int write_count = 0;
-
-    if (current_state == ControlState::WRITE_PACKET)
-    {
-        ++write_count;
-
-        const auto current_time = std::chrono::steady_clock::now();
-        const std::chrono::duration<double> elapsed = current_time - last_print_time;
-
-        if (elapsed.count() >= 1.0)
-        {
-            // const double hz = write_count / elapsed.count();
-            // RCLCPP_INFO(this->get_logger(), "Motor Control Rate: %.2f Hz", hz);
-            last_print_time = current_time;
-            write_count = 0;
-        }
-    }
-
-    switch (current_state)
-    {
-        case ControlState::WRITE_PACKET:
-            handle_write_packet();
-            break;
-        case ControlState::READ_PACKET:
-            handle_read_packet();
-            break;
-    }
+    handle_read_packet();
+    handle_write_packet();
 }
 // bool MainControlNode::isStartPositionReady(std::string* reason)
 // {
@@ -991,11 +1153,6 @@ void MainControlNode::control_loop()
 //     return true;
 // }
 
-void MainControlNode::transition_to(ControlState new_state)
-{
-    current_state = new_state;
-}
-
 float MainControlNode::computeWrappedCommand(float current_raw_pos, float target_wrapped_pos) const
 {
     float diff = target_wrapped_pos - wrapToPi(current_raw_pos);
@@ -1018,15 +1175,6 @@ void MainControlNode::handle_read_packet()
 
     std::vector<bool> current_cycle_updated(all_motors_.size(), false);
 
-    std::vector<uint64_t> generations;
-    generations.reserve(can_groups_.size());
-    for (auto& group : can_groups_)
-    {
-        generations.push_back(group.worker ? group.worker->requestRead() : 0);
-    }
-    waitForWorkerOperations(
-        generations, WORKER_COMPLETION_TIMEOUT, "READ");
-
     for (auto& group : can_groups_)
     {
         if (!group.worker)
@@ -1045,16 +1193,22 @@ void MainControlNode::handle_read_packet()
 
             if (state.updated && state.valid)
             {
+                const bool new_feedback =
+                    state.feedback_time >
+                    latest_motor_states_[index].feedback_time;
                 const bool new_status_feedback =
                     state.feedback_sequence >
                     latest_motor_states_[index].feedback_sequence;
-                latest_motor_states_[index] = state;
-                current_cycle_updated[index] = true;
+                if (new_feedback)
+                {
+                    latest_motor_states_[index] = state;
+                    current_cycle_updated[index] = true;
+                }
 
                 if (torque_enabled_ && new_status_feedback &&
                     state.fault_flags != 0)
                 {
-                    requestFatalShutdown(
+                    enterFrozen(
                         "[Safety] Motor fault feedback: motor_id=" +
                         std::to_string(state.motor_id) +
                         " bus=" + packet_index_to_bus_[index] +
@@ -1066,12 +1220,54 @@ void MainControlNode::handle_read_packet()
                 if (torque_enabled_ && new_status_feedback &&
                     state.run_state != MOTOR_RUN_STATE)
                 {
-                    requestFatalShutdown(
+                    enterFrozen(
                         "[Safety] Motor left enabled state: motor_id=" +
                         std::to_string(state.motor_id) +
                         " bus=" + packet_index_to_bus_[index] +
                         " run_state=" + std::to_string(state.run_state));
                     return;
+                }
+            }
+        }
+    }
+
+    if (torque_enabled_ && init_phase_ != InitPhase::COLLECT_FEEDBACK &&
+        policy_state_ != SystemPolicyState::FROZEN &&
+        policy_state_ != SystemPolicyState::ESTOPPED)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < latest_motor_states_.size(); ++i)
+        {
+            const auto stamp = latest_motor_states_[i].feedback_time;
+            if (stamp == std::chrono::steady_clock::time_point{})
+            {
+                continue;
+            }
+            const auto age = now - stamp;
+            if (age > FEEDBACK_FREEZE_TIMEOUT)
+            {
+                enterFrozen(
+                    "[Safety] Feedback stale: motor_id=" +
+                    std::to_string(motor_ids_[i]) +
+                    " bus=" + packet_index_to_bus_[i] +
+                    " age_ms=" + std::to_string(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(age).count()));
+                break;
+            }
+            if (age > FEEDBACK_WARN_TIMEOUT)
+            {
+                policy_state_ = SystemPolicyState::DEGRADED;
+                if (shouldEmitLog(
+                    "feedback_delayed:" + std::to_string(motor_ids_[i]),
+                    std::chrono::milliseconds(1000)))
+                {
+                    RCLCPP_WARN(
+                        this->get_logger(),
+                        "[Safety] Feedback delayed: motor_id=%u bus=%s age_ms=%ld",
+                        static_cast<unsigned>(motor_ids_[i]),
+                        packet_index_to_bus_[i].c_str(),
+                        static_cast<long>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(age).count()));
                 }
             }
         }
@@ -1131,8 +1327,8 @@ void MainControlNode::handle_read_packet()
             // else
             // {
             //     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            //         "[InitValidation] Invalid q feedback ignored. motor_index=%zu raw_pos=%.6f",
-            //         i,
+            //         "[InitValidation] Invalid q feedback ignored. motor_id=%u bus=%s raw_pos=%.6f",
+            //         static_cast<unsigned>(motor_ids_[i]), packet_index_to_bus_[i].c_str(),
             //         raw_pos);
             // }
             if (init_phase_ == InitPhase::COLLECT_FEEDBACK)
@@ -1167,16 +1363,20 @@ void MainControlNode::handle_read_packet()
                 }
                 else
                 {
-                    RCLCPP_WARN_THROTTLE(
-                        this->get_logger(),
-                        *this->get_clock(),
-                        1000,
-                        "[InitCollect] Invalid feedback: "
-                        "motor=%zu q=%.6f qdot=%.6f current=%.6f",
-                        i,
-                        raw_pos,
-                        raw_velocity,
-                        current);
+                    if (shouldEmitLog(
+                        "invalid_feedback:" + std::to_string(motor_ids_[i]),
+                        std::chrono::milliseconds(1000)))
+                    {
+                        RCLCPP_WARN(
+                            this->get_logger(),
+                            "[InitCollect] Invalid feedback: "
+                            "motor_id=%u bus=%s q=%.6f qdot=%.6f current=%.6f",
+                            static_cast<unsigned>(motor_ids_[i]),
+                            packet_index_to_bus_[i].c_str(),
+                            raw_pos,
+                            raw_velocity,
+                            current);
+                    }
 
                     // 연속 정상 샘플을 요구한다면 비정상값 발생 시 초기화
                     init_position_samples_[i].clear();
@@ -1214,10 +1414,9 @@ void MainControlNode::handle_read_packet()
             msg.states[i].current = latest_motor_states_[i].current;
 
             // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            //     "[Read] bus=%s packet_index=%zu motor_id=%u update failed (success=%d fail=%d)",
-            //     packet_index_to_bus_[i].c_str(),
-            //     i,
+            //     "[Read] motor_id=%u bus=%s update failed (success=%d fail=%d)",
             //     msg.states[i].motor_id,
+            //     packet_index_to_bus_[i].c_str(),
             //     success_count,
             //     fail_count);
         }
@@ -1234,21 +1433,19 @@ void MainControlNode::handle_read_packet()
 
     if (init_phase_ == InitPhase::COLLECT_FEEDBACK)
     {
-        std::string reason;
+        const InitSampleCheckReport sample_report = checkInitialSamples();
+        const std::string detail = formatInitSampleReport(sample_report);
 
-        const InitSampleCheckResult check_result =
-            checkInitialSamples(&reason);
-
-        if (check_result == InitSampleCheckResult::Fatal)
+        if (sample_report.result == InitSampleCheckResult::Fatal)
         {
-            requestFatalShutdown(
+            enterFrozen(
                 "[Init] Initial sample validation failed: " +
-                reason);
+                detail);
 
             return;
         }
 
-        if (check_result == InitSampleCheckResult::Ready)
+        if (sample_report.result == InitSampleCheckResult::Ready)
         {
             start_positions_.resize(all_motors_.size());
 
@@ -1265,12 +1462,9 @@ void MainControlNode::handle_read_packet()
                     std::fabs(median_position) >
                         INIT_Q_ABS_LIMIT)
                 {
-                    requestFatalShutdown(
-                        "[Init] Invalid median position: "
-                        "motor=" + std::to_string(i) +
-                        " motor_id=" +
-                        std::to_string(
-                            motor_ids_[i]) +
+                    enterFrozen(
+                        "[Init] Invalid median position: " +
+                        formatMotorContext(i) +
                         " median=" +
                         std::to_string(median_position));
 
@@ -1283,23 +1477,24 @@ void MainControlNode::handle_read_packet()
                 RCLCPP_INFO(
                     this->get_logger(),
                     "[Init] Start position validated: "
-                    "motor=%zu motor_id=%u "
+                    "motor_id=%u bus=%s "
                     "median=%.6f samples=%zu",
-                    i,
-                    static_cast<unsigned>(
-                        motor_ids_[i]),
+                    static_cast<unsigned>(motor_ids_[i]),
+                    packet_index_to_bus_[i].c_str(),
                     median_position,
                     init_position_samples_[i].size());
             }
 
             start_positions_captured_ = true;
             init_phase_ = InitPhase::WAIT_COMMAND;
-            init_tick_count_ = 0;
+            interpolation_cycle_count_ = 0;
+            interpolation_start_time_ = {};
 
             RCLCPP_INFO(
                 this->get_logger(),
-                "[Init] All initial positions validated. "
-                "Waiting for upper command.");
+                "[Init] All initial positions validated: motor_ids=%s; "
+                "waiting for upper command.",
+                formatMotorIdList(motor_ids_).c_str());
         }
         else
         {
@@ -1308,7 +1503,7 @@ void MainControlNode::handle_read_packet()
                 *this->get_clock(),
                 1000,
                 "[Init] Collecting feedback: %s",
-                reason.c_str());
+                detail.c_str());
         }
 
         const auto elapsed =
@@ -1319,9 +1514,9 @@ void MainControlNode::handle_read_packet()
             std::chrono::milliseconds(
                 INIT_COLLECTION_TIMEOUT_MS))
         {
-            requestFatalShutdown(
+            enterFrozen(
                 "[Init] Initial feedback collection timeout: " +
-                reason);
+                detail);
 
             return;
         }
@@ -1329,60 +1524,60 @@ void MainControlNode::handle_read_packet()
 
     // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "stabilzation_ : %s, cycle_fali_count : %d", last_read_cycle_all_updated_ ? "true" : "false", cycle_fail_count);
     state_pub->publish(msg);
-    transition_to(ControlState::WRITE_PACKET);
 }
 
 void MainControlNode::logWriteSummaryThrottle()
 {
-    for (const auto& group : can_groups_)
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& group : can_groups_)
     {
         if (!group.worker)
         {
             continue;
         }
+        if (group.last_write_summary_log !=
+                std::chrono::steady_clock::time_point{} &&
+            now - group.last_write_summary_log < std::chrono::seconds(5))
+        {
+            continue;
+        }
+        group.last_write_summary_log = now;
         const BusWriteStats stats =
             group.worker->getWriteStatsSnapshot();
-        RCLCPP_INFO_THROTTLE(
+        const std::string motor_ids =
+            formatMotorIdList(getGroupMotorIds(group));
+        RCLCPP_INFO(
             this->get_logger(),
-            *this->get_clock(),
-            5000,
             "[WriteSummary] "
-            "bus=%s "
+            "motor_ids=%s bus=%s "
             "ok=%lu fail=%lu "
             "eagain_total=%lu "
             "eagain_cycles=%u "
             "enobufs_total=%lu "
             "enobufs_cycles=%u",
-            group.interface_name.c_str(),
+            motor_ids.c_str(), group.interface_name.c_str(),
             static_cast<unsigned long>(stats.ok_writes),
             static_cast<unsigned long>(stats.fail_writes),
             static_cast<unsigned long>(stats.eagain_count),
-            stats
-                .consecutive_eagain_cycles,
+            stats.consecutive_eagain_cycles,
             static_cast<unsigned long>(stats.enobufs_count),
-            stats
-                .consecutive_enobufs_cycles);
+            stats.consecutive_enobufs_cycles);
     }
 }
 
 void MainControlNode::handle_write_packet()
 {
-    constexpr auto EAGAIN_FATAL_DURATION =
-        std::chrono::milliseconds(200);
-    constexpr uint32_t ENOBUFS_FATAL_CYCLES = 5;
-
-    if (!torque_enabled_)
+    if (policy_state_ == SystemPolicyState::FROZEN ||
+        policy_state_ == SystemPolicyState::ESTOPPED ||
+        !torque_enabled_)
     {
-        transition_to(ControlState::READ_PACKET);
+        sendSafetyDisableBatches();
         return;
     }
 
     if (init_phase_ == InitPhase::COLLECT_FEEDBACK)
     {
-        if (sendZeroCommands())
-        {
-            transition_to(ControlState::READ_PACKET);
-        }
+        sendZeroCommands();
         return;
     }
 
@@ -1396,17 +1591,16 @@ void MainControlNode::handle_write_packet()
 
         if (!command_ready)
         {
-            if (sendZeroCommands())
-            {
-                transition_to(ControlState::READ_PACKET);
-            }
+            sendZeroCommands();
             return;
         }
 
-        init_tick_count_ = 0;
+        interpolation_cycle_count_ = 0;
+        interpolation_start_time_ = std::chrono::steady_clock::now();
         init_phase_ = InitPhase::INTERPOLATING;
         RCLCPP_INFO(this->get_logger(),
-            "[Init] Upper command available. Starting interpolation.");
+            "[Init] Upper command available. Starting %.3f s interpolation.",
+            initial_interpolation_duration_sec_);
     }
 
     roa_interfaces::msg::MotorCommandArray command_snapshot;
@@ -1414,7 +1608,6 @@ void MainControlNode::handle_write_packet()
         std::lock_guard<std::mutex> lock(command_mutex_);
         if (!packet_initialized_)
         {
-            transition_to(ControlState::READ_PACKET);
             return;
         }
         command_snapshot = packet_commands_;
@@ -1423,12 +1616,13 @@ void MainControlNode::handle_write_packet()
     float alpha = 0.0f;
     if (init_phase_ == InitPhase::INTERPOLATING)
     {
-        ++init_tick_count_;
-        alpha = std::clamp(
-            static_cast<float>(init_tick_count_) /
-                static_cast<float>(INIT_TOTAL_TICKS),
-            0.0f,
-            1.0f);
+        ++interpolation_cycle_count_;
+        const std::chrono::duration<double> elapsed =
+            std::chrono::steady_clock::now() - interpolation_start_time_;
+        alpha = static_cast<float>(std::clamp(
+            elapsed.count() / initial_interpolation_duration_sec_,
+            0.0,
+            1.0));
     }
 
     for (auto& group : can_groups_)
@@ -1442,8 +1636,12 @@ void MainControlNode::handle_write_packet()
                 packet_index >= latest_motor_states_.size())
             {
                 requestFatalShutdown(
-                    "[Write] Invalid global packet index: " +
-                    std::to_string(packet_index));
+                    "[InternalInvariant] Invalid packet_index=" +
+                    std::to_string(packet_index) +
+                    " command_size=" +
+                    std::to_string(command_snapshot.commands.size()) +
+                    " state_size=" +
+                    std::to_string(latest_motor_states_.size()));
                 return;
             }
 
@@ -1483,69 +1681,32 @@ void MainControlNode::handle_write_packet()
 
         if (!group.worker)
         {
+            const std::string motor_ids =
+                formatMotorIdList(getGroupMotorIds(group));
             requestFatalShutdown(
-                "[Write] Missing CAN worker: bus=" + group.interface_name);
+                "[Write] Missing CAN worker: motor_ids=" + motor_ids +
+                " bus=" + group.interface_name);
             return;
         }
-        group.worker->setCommandData(bus_command);
-    }
-
-    std::vector<uint64_t> generations;
-    generations.reserve(can_groups_.size());
-    for (auto& group : can_groups_)
-    {
-        generations.push_back(group.worker->requestWrite());
-    }
-
-    waitForWorkerOperations(
-        generations, WORKER_COMPLETION_TIMEOUT, "WRITE");
-
-    for (auto& group : can_groups_)
-    {
-        const BusWriteStats stats =
-            group.worker->getWriteStatsSnapshot();
-        const BusWorkerStatus status =
-            group.worker->getStatusSnapshot();
-
-        if (status.last_result == WorkerResult::BusUnavailable)
-        {
-            requestFatalShutdown(
-                "[Safety] CAN bus unavailable: bus=" +
-                group.interface_name);
-            return;
-        }
-
-        if (stats.eagain_active &&
-            std::chrono::steady_clock::now() -
-                stats.first_eagain_time >= EAGAIN_FATAL_DURATION)
-        {
-            requestFatalShutdown(
-                "[Safety] Persistent CAN EAGAIN: bus=" +
-                group.interface_name);
-            return;
-        }
-
-        if (stats.consecutive_enobufs_cycles >=
-            ENOBUFS_FATAL_CYCLES)
-        {
-            requestFatalShutdown(
-                "[Safety] Persistent ENOBUFS: bus=" +
-                group.interface_name);
-            return;
-        }
+        const BusSendReport report =
+            group.worker->sendCommandData(bus_command);
+        handleBusSendResult(group.interface_name, report, "COMMAND");
     }
 
     if (init_phase_ == InitPhase::INTERPOLATING && alpha >= 1.0f)
     {
+        const std::chrono::duration<double> actual_elapsed =
+            std::chrono::steady_clock::now() - interpolation_start_time_;
         init_phase_ = InitPhase::RUNNING;
         walk_initialized_ = true;
         RCLCPP_INFO(this->get_logger(),
-            "[Init] initialization interpolation completed after %d ticks",
-            init_tick_count_);
+            "[Init] initialization interpolation completed after %.3f s "
+            "(%lu control cycles)",
+            actual_elapsed.count(),
+            static_cast<unsigned long>(interpolation_cycle_count_));
     }
 
     logWriteSummaryThrottle();
-    transition_to(ControlState::READ_PACKET);
 }
 void MainControlNode::publishWalkInitialized(bool initialized)
 {
@@ -1595,71 +1756,148 @@ void MainControlNode::walkCallback(
     if (init_phase_ == InitPhase::WAIT_COMMAND &&
         start_positions_captured_)
     {
-        init_tick_count_ = 0;
+        interpolation_cycle_count_ = 0;
+        interpolation_start_time_ = std::chrono::steady_clock::now();
         init_phase_ = InitPhase::INTERPOLATING;
 
         RCLCPP_INFO(
             this->get_logger(),
             "[Init] First upper command received. "
-            "Starting interpolation.");
+            "Starting %.3f s interpolation.",
+            initial_interpolation_duration_sec_);
     }
 }
 
 void MainControlNode::torqueCallback(const std_msgs::msg::Bool::SharedPtr msg)
 {
-    const bool torque_enable = msg->data;
-
-    timer_.reset();
-    stopWorkers();
-
-    for (size_t i = 0; i < all_motors_.size(); ++i)
+    if (!msg->data)
     {
-        bool ok = false;
-
-        if (torque_enable)
-        {
-            ok = all_motors_[i]->enable();
-            if (ok)
-            {
-                RCLCPP_INFO(this->get_logger(),
-                    "[Torque Callback] Motor[%zu] enable command sent", i);
-            }
-            else
-            {
-                RCLCPP_ERROR(this->get_logger(),
-                    "[Torque Callback] Failed to enable motor[%zu] (bus=%s, motor_id=%u)",
-                    i,
-                    packet_index_to_bus_[i].c_str(),
-                    motor_ids_[i]);
-            }
-        }
-        else
-        {
-            ok = all_motors_[i]->disable();
-            if (ok)
-            {
-                RCLCPP_INFO(this->get_logger(),
-                    "[Torque Callback] Motor[%zu] disabled successfully", i);
-            }
-            else
-            {
-                RCLCPP_ERROR(this->get_logger(),
-                    "[Torque Callback] Failed to disable motor[%zu] (bus=%s, motor_id=%u)",
-                    i,
-                    packet_index_to_bus_[i].c_str(),
-                    motor_ids_[i]);
-            }
-        }
-    }
-
-    torque_enabled_ = torque_enable;
-    if (!startWorkers())
-    {
-        requestFatalShutdown("[Torque Callback] Failed to restart CAN workers");
+        torque_enabled_ = false;
+        policy_state_ = SystemPolicyState::ESTOPPED;
+        walk_initialized_ = false;
+        sendSafetyDisableBatches();
+        const std::string motor_ids = formatMotorIdList(motor_ids_);
+        RCLCPP_ERROR(this->get_logger(),
+            "[EStop] Entered ESTOPPED state: motor_ids=%s. Process remains alive; "
+            "deactivate/activate lifecycle transition is required to resume.",
+            motor_ids.c_str());
         return;
     }
-    current_state = ControlState::WRITE_PACKET;
-    startControlLoopTimer();
+
+    RCLCPP_WARN(this->get_logger(),
+        "[EStop] Enable request ignored while safety state is latched. "
+        "Use a fresh lifecycle deactivate/activate transition.");
+}
+
+void MainControlNode::enterFrozen(const std::string& reason)
+{
+    if (policy_state_ == SystemPolicyState::FROZEN ||
+        policy_state_ == SystemPolicyState::ESTOPPED)
+    {
+        return;
+    }
+    policy_state_ = SystemPolicyState::FROZEN;
+    torque_enabled_ = false;
+    walk_initialized_ = false;
+    RCLCPP_ERROR(this->get_logger(),
+        "[Frozen] %s. Upper commands are ignored; lifecycle reactivation is required.",
+        reason.c_str());
+    sendSafetyDisableBatches();
+}
+
+void MainControlNode::handleBusSendResult(
+    const std::string& bus,
+    const BusSendReport& report,
+    const char* operation)
+{
+    if (report.result == WorkerResult::Success)
+    {
+        tx_degraded_since_.erase(bus);
+        if (tx_degraded_since_.empty() &&
+            policy_state_ == SystemPolicyState::DEGRADED)
+        {
+            policy_state_ = SystemPolicyState::ACTIVE;
+        }
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto inserted = tx_degraded_since_.emplace(bus, now);
+    policy_state_ = SystemPolicyState::DEGRADED;
+    const std::string failed_ids =
+        formatMotorIdList(report.failed_motor_ids);
+    if (shouldEmitLog(
+        "tx:" + std::string(operation) + ':' + bus,
+        std::chrono::milliseconds(1000)))
+    {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "[CAN TX] %s batch incomplete: failed_motor_ids=%s bus=%s "
+            "queued=%zu/%zu errno=%d (%s)",
+            operation, failed_ids.c_str(), bus.c_str(),
+            report.queued, report.requested, report.error_number,
+            report.error_number != 0
+                ? std::strerror(report.error_number) : "none");
+    }
+
+    if (!inserted.second &&
+        now - inserted.first->second > TX_DEGRADED_FREEZE_TIMEOUT)
+    {
+        enterFrozen(
+            "[Safety] Persistent CAN TX degradation: failed_motor_ids=" +
+            failed_ids + " bus=" + bus +
+            " operation=" + operation);
+    }
+}
+
+void MainControlNode::sendSafetyDisableBatches()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (last_safety_disable_time_ !=
+            std::chrono::steady_clock::time_point{} &&
+        now - last_safety_disable_time_ < SAFETY_DISABLE_INTERVAL)
+    {
+        return;
+    }
+    last_safety_disable_time_ = now;
+    for (auto& group : can_groups_)
+    {
+        if (!group.worker)
+        {
+            const std::string motor_ids =
+                formatMotorIdList(getGroupMotorIds(group));
+            if (shouldEmitLog(
+                "safety_disable:" + group.interface_name,
+                std::chrono::milliseconds(1000)))
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[Safety] Disable batch failed: "
+                    "motor_ids=%s bus=%s reason=missing_worker",
+                    motor_ids.c_str(), group.interface_name.c_str());
+            }
+            continue;
+        }
+        const BusSendReport report = group.worker->sendDisableAll();
+        if (report.result != WorkerResult::Success)
+        {
+            const std::string failed_ids =
+                formatMotorIdList(report.failed_motor_ids);
+            if (shouldEmitLog(
+                "safety_disable:" + group.interface_name,
+                std::chrono::milliseconds(1000)))
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[Safety] Disable batch incomplete: failed_motor_ids=%s "
+                    "bus=%s queued=%zu/%zu errno=%d (%s)",
+                    failed_ids.c_str(), group.interface_name.c_str(),
+                    report.queued, report.requested, report.error_number,
+                    report.error_number != 0
+                        ? std::strerror(report.error_number) : "none");
+            }
+        }
+    }
 }
 
 // 디버그용: CAN 수신 큐 플러시
@@ -1670,6 +1908,8 @@ void MainControlNode::flushCanRxQueues(const char* tag)
 
     for (auto& group : can_groups_)
     {
+        const std::string motor_ids =
+            formatMotorIdList(getGroupMotorIds(group));
         int flushed = 0;
 
         while (group.transport && group.transport->receive(rx_id, rx_data, 0))
@@ -1678,8 +1918,9 @@ void MainControlNode::flushCanRxQueues(const char* tag)
         }
 
         RCLCPP_WARN(this->get_logger(),
-            "[CAN Flush:%s] bus=%s flushed %d pending RX frames",
+            "[CAN Flush:%s] motor_ids=%s bus=%s flushed=%d pending_rx_frames",
             tag,
+            motor_ids.c_str(),
             group.interface_name.c_str(),
             flushed);
     }

@@ -6,7 +6,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -38,12 +37,9 @@ public:
     const std::string& getInterfaceName() const;
     std::size_t getMotorCount() const;
 
-    void setCommandData(const BusCommandData& command_data);
-    uint64_t requestRead();
-    uint64_t requestWrite();
-    bool waitUntilCompleted(
-        uint64_t generation,
-        std::chrono::microseconds timeout);
+    BusSendReport sendCommandData(const BusCommandData& command_data);
+    BusSendReport sendDisableAll();
+    BusSendReport configureCanWatchdog(uint32_t timeout_raw);
 
     BusStateData getStateSnapshot() const;
     BusWriteStats getWriteStatsSnapshot() const;
@@ -52,18 +48,17 @@ public:
     void resetStatistics();
 
 private:
-    uint64_t requestOperation(WorkerOperation operation);
     void workerLoop();
-    BusStateData performRead();
-    WorkerResult performWrite();
-    WriteResult safeSendCommand(
-        RobStrideMotor& motor,
-        const MotorCommandData& command);
+    void processReceivedFrame(
+        uint32_t can_id,
+        const std::vector<uint8_t>& data);
+    BusSendReport sendFrames(
+        const std::vector<CanTxFrameData>& frames);
     std::size_t findLocalMotorIndex(uint8_t motor_id) const;
     void initializeStateBuffer();
 
-    static constexpr std::size_t MAX_RX_PACKETS_PER_CYCLE = 50;
-    static constexpr auto READ_TIMEOUT = std::chrono::microseconds(1000);
+    static constexpr std::size_t MAX_RX_BATCH = 64;
+    static constexpr int RX_POLL_TIMEOUT_MS = 10;
 
     std::string interface_name_;
     std::shared_ptr<CanTransport> transport_;
@@ -74,17 +69,6 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> busy_{false};
-
-    mutable std::mutex work_mutex_;
-    std::condition_variable work_cv_;
-    WorkerOperation requested_operation_{WorkerOperation::None};
-    uint64_t requested_generation_{0};
-    uint64_t completed_generation_{0};
-
-    std::condition_variable completion_cv_;
-
-    mutable std::mutex command_mutex_;
-    BusCommandData command_data_;
 
     mutable std::mutex state_mutex_;
     BusStateData state_data_;

@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <string>
 #include <iostream>
@@ -46,11 +47,27 @@ enum class ControlState
     READ_PACKET
 };
 
+enum class SystemPolicyState
+{
+    ACTIVE,
+    DEGRADED,
+    FROZEN,
+    ESTOPPED
+};
+
 enum class InitSampleCheckResult
 {
     Collecting,  // 아직 샘플이 부족함
     Ready,       // 샘플이 충분하고 안정적임
     Fatal        // 샘플은 충분하지만 비정상 상태
+};
+
+struct InitSampleCheckReport
+{
+    InitSampleCheckResult result{InitSampleCheckResult::Collecting};
+    std::optional<uint16_t> motor_id;
+    std::string bus;
+    std::string detail;
 };
 
 struct CanBusGroup
@@ -60,6 +77,7 @@ struct CanBusGroup
     std::vector<std::shared_ptr<RobStrideMotor>> motors;
     std::vector<size_t> global_packet_indices;
     std::shared_ptr<CanBusWorker> worker;
+    std::chrono::steady_clock::time_point last_write_summary_log{};
 };
 
 class MainControlNode : public rclcpp_lifecycle::LifecycleNode
@@ -92,7 +110,6 @@ private:
 
     void handle_read_packet();
     void handle_write_packet();
-    void transition_to(ControlState new_state);
     void initParameters();
     bool updateControlLoopPeriod();
     void startControlLoopTimer();
@@ -110,10 +127,23 @@ private:
     void stopWorkers();
     bool confirmMotorEnableStates(
         const std::vector<uint64_t>& baseline_sequences);
-    bool waitForWorkerOperations(
-        const std::vector<uint64_t>& generations,
-        std::chrono::microseconds timeout,
+    bool collectInitialFeedbackDisabled();
+    void enterFrozen(const std::string& reason);
+    void sendSafetyDisableBatches();
+    void handleBusSendResult(
+        const std::string& bus,
+        const BusSendReport& report,
         const char* operation);
+    std::string formatMotorContext(std::size_t motor_index) const;
+    std::string formatMotorIdList(
+        const std::vector<uint16_t>& motor_ids) const;
+    std::vector<uint16_t> getGroupMotorIds(
+        const CanBusGroup& group) const;
+    std::string formatInitSampleReport(
+        const InitSampleCheckReport& report) const;
+    bool shouldEmitLog(
+        const std::string& key,
+        std::chrono::milliseconds interval);
     // bool isStartPositionReady(std::string* reason);
 
     std::vector<CanBusGroup> can_groups_;
@@ -123,23 +153,28 @@ private:
 
     rclcpp::TimerBase::SharedPtr timer_;
     double control_frequency_hz_{150.0};
+    double initial_interpolation_duration_sec_{1.0};
     std::chrono::nanoseconds control_loop_period_{std::chrono::nanoseconds(3333333)};
     rclcpp::Subscription<roa_interfaces::msg::MotorCommandArray>::SharedPtr walk_sub;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr torque_sub;
     rclcpp::Publisher<roa_interfaces::msg::MotorStateArray>::SharedPtr state_pub;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr initial_pub;
 
-    ControlState current_state{ControlState::READ_PACKET};
-
     std::vector<std::string> packet_index_to_bus_;
-
-    static constexpr auto WORKER_COMPLETION_TIMEOUT =
-        std::chrono::microseconds(2500);
     static constexpr auto ENABLE_CONFIRMATION_TIMEOUT =
         std::chrono::milliseconds(2000);
     static constexpr auto ENABLE_RESEND_INTERVAL =
         std::chrono::milliseconds(200);
     static constexpr uint8_t MOTOR_RUN_STATE = 2;
+    static constexpr auto FEEDBACK_WARN_TIMEOUT =
+        std::chrono::milliseconds(20);
+    static constexpr auto FEEDBACK_FREEZE_TIMEOUT =
+        std::chrono::milliseconds(100);
+    static constexpr auto SAFETY_DISABLE_INTERVAL =
+        std::chrono::milliseconds(100);
+    static constexpr auto TX_DEGRADED_FREEZE_TIMEOUT =
+        std::chrono::milliseconds(100);
+    static constexpr uint32_t MOTOR_CAN_TIMEOUT_RAW = 3000; // 150 ms at 1/20000 s
 
     std::mutex command_mutex_;
 
@@ -151,8 +186,8 @@ private:
     bool walk_initialized_ = false;
     bool start_positions_captured_ = false;
     std::vector<float> start_positions_;
-    int init_tick_count_ = 0;
-    static constexpr int INIT_TOTAL_TICKS = 100;
+    uint64_t interpolation_cycle_count_ = 0;
+    std::chrono::steady_clock::time_point interpolation_start_time_{};
     bool start_position_init_attempted_ = false;
     bool last_read_cycle_all_updated_ = false;
 
@@ -161,6 +196,12 @@ private:
     roa_interfaces::msg::MotorCommandArray packet_commands_;
     bool packet_initialized_{false};
     bool torque_enabled_{false};
+    SystemPolicyState policy_state_{SystemPolicyState::ACTIVE};
+    std::chrono::steady_clock::time_point last_safety_disable_time_{};
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        tx_degraded_since_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        log_throttle_times_;
 
     // ===== Init start position validation =====
     static constexpr float INIT_Q_ABS_LIMIT =
@@ -179,8 +220,7 @@ private:
 
     // ----------------------------- WJ 초기 피드백 수집 및 상태 확인 -----------------------------
     bool sendZeroCommands();
-    InitSampleCheckResult checkInitialSamples(
-        std::string* reason) const;
+    InitSampleCheckReport checkInitialSamples() const;
     float computeMedian(const std::deque<float>& samples) const;
 
     static constexpr std::size_t INIT_REQUIRED_SAMPLES = 20;

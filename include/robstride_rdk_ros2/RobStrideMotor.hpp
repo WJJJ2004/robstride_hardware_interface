@@ -32,6 +32,11 @@ public:
     bool disable();
 
     bool sendMotionCommand(float torque, float position, float velocity, float kp, float kd);
+    CanTxFrameData createMotionCommand(
+        float torque, float position, float velocity, float kp, float kd) const;
+    CanTxFrameData createEnableCommand() const;
+    CanTxFrameData createDisableCommand() const;
+    CanTxFrameData createCanTimeoutCommand(uint32_t timeout_raw) const;
     void processPacket(uint32_t rx_id, const std::vector<uint8_t>& rx_data);
 
     // Getters
@@ -41,6 +46,7 @@ public:
     float getTorque() const { return torque_; }
     float getTemperature() const { return temperature_; }
     float getCurrent() const { return current_; }
+    const MotorLimits& getLimits() const { return limits_; }
     uint8_t getRunState() const { return run_state_.load(std::memory_order_acquire); }
     uint8_t getFaultFlags() const { return fault_flags_.load(std::memory_order_acquire); }
     uint64_t getFeedbackSequence() const { return feedback_sequence_.load(std::memory_order_acquire); }
@@ -63,7 +69,6 @@ private:
     std::atomic<uint64_t> feedback_sequence_{0};
 
     void loadLimits();
-    float getVelocityFeedbackScale() const;
 };
 
 // struct CanBusGroup

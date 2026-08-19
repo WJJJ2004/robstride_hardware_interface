@@ -32,6 +32,7 @@ public:
 
     // Float <-> Uint 변환 (SDK 핵심 로직)
     static uint16_t floatToUint(float x, float x_min, float x_max, int bits);
+    static float uintToFloat(uint16_t x, float x_min, float x_max, int bits);
 
     // 명령 패킷 생성: Motion Control (MIT Mode)
     static std::vector<uint8_t> createMotionCommand(

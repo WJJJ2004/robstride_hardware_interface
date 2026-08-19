@@ -1,5 +1,6 @@
 #include "robstride_rdk_ros2/RobStrideMotor.hpp"
 #include <rclcpp/rclcpp.hpp>
+#include <cstring>
 
 RobStrideMotor::RobStrideMotor(std::shared_ptr<CanTransport> transport, uint8_t motor_id, ActuatorType type)
     : transport_(transport), motor_id_(motor_id), type_(type)
@@ -9,69 +10,50 @@ RobStrideMotor::RobStrideMotor(std::shared_ptr<CanTransport> transport, uint8_t 
 
 void RobStrideMotor::loadLimits()
 {
+    // RobStride private-protocol Type-1/Type-2 quantization ranges.
+    // Source: RobStride motor communication protocol summary, 2025-12-29.
+    constexpr float POSITION_LIMIT = 12.57f;
     switch(type_)
     {
         case ActuatorType::ROBSTRIDE_00:
-            limits_ = { 4 * M_PI, 50.0f, 17.0f, 500.0f, 5.0f };
+            limits_ = { POSITION_LIMIT, 33.0f, 14.0f, 500.0f, 5.0f };
             break;
         case ActuatorType::ROBSTRIDE_01:
-            limits_ = { 4 * M_PI, 50.0f, 17.0f, 1500.0f, 20.0f };
+            limits_ = { POSITION_LIMIT, 44.0f, 17.0f, 500.0f, 5.0f };
             break;
         case ActuatorType::ROBSTRIDE_02:
-            limits_ = { 4 * M_PI, 40.0f, 34.0f, 2000.0f, 20.0f };
+            limits_ = { POSITION_LIMIT, 44.0f, 17.0f, 500.0f, 5.0f };
             break;
         case ActuatorType::ROBSTRIDE_03:
-            limits_ = { 4 * M_PI, 30.0f, 34.0f, 3000.0f, 50.0f };
+            limits_ = { POSITION_LIMIT, 20.0f, 60.0f, 5000.0f, 100.0f };
             break;
         case ActuatorType::ROBSTRIDE_04:
-            limits_ = { 4 * M_PI, 25.0f, 50.0f, 4000.0f, 80.0f };
+            limits_ = { POSITION_LIMIT, 15.0f, 120.0f, 5000.0f, 100.0f };
             break;
         case ActuatorType::ROBSTRIDE_05:
-            limits_ = { 4 * M_PI, 20.0f, 60.0f, 5000.0f, 100.0f };
+            limits_ = { POSITION_LIMIT, 50.0f, 5.5f, 500.0f, 5.0f };
             break;
         case ActuatorType::ROBSTRIDE_06:
-            limits_ = { 4 * M_PI, 20.0f, 60.0f, 5000.0f, 100.0f };
+            limits_ = { POSITION_LIMIT, 50.0f, 36.0f, 5000.0f, 100.0f };
             break;
         case ActuatorType::CUSTOM:
         default:
-            limits_ = { 4 * M_PI, 50.0f, 17.0f, 1500.0f, 20.0f };
+            limits_ = { POSITION_LIMIT, 50.0f, 17.0f, 1500.0f, 20.0f };
             break;
-    }
-}
-
-float RobStrideMotor::getVelocityFeedbackScale() const
-{
-    // taget / raw feedback 선형 스케일링
-    // 로빛 노션 자료: https://www.notion.so/robitkw/feedback-qd-scale-issue-35fa551c9cc0803eafebccf01a50fd2a
-    switch (type_)
-    {
-        case ActuatorType::ROBSTRIDE_06:
-            return 2.50f;
-
-        case ActuatorType::ROBSTRIDE_03:
-            return 0.67f;
-
-        case ActuatorType::ROBSTRIDE_04:
-            return 0.60f;
-
-        default:
-            return 1.0f;
     }
 }
 
 bool RobStrideMotor::enable()
 {
-    uint32_t id = RobStrideProtocol::generateCommandId(
-        ProtocolCmd::MOTOR_ENABLE, master_id_, motor_id_);
+    const auto frame = createEnableCommand();
 
-    auto data = RobStrideProtocol::createEnableCommand();
-
-    if (transport_->send(id, data))
+    if (transport_->send(frame))
     {
         RCLCPP_INFO(
             rclcpp::get_logger("robstride_motor"),
-            "Motor %u Enable Command Sent.",
-            static_cast<unsigned>(motor_id_));
+            "Enable command sent: motor_id=%u bus=%s",
+            static_cast<unsigned>(motor_id_),
+            transport_->getInterfaceName().c_str());
         return true;
     }
     return false;
@@ -79,23 +61,28 @@ bool RobStrideMotor::enable()
 
 bool RobStrideMotor::disable()
 {
-    uint32_t id = RobStrideProtocol::generateCommandId(
-        ProtocolCmd::MOTOR_STOP, master_id_, motor_id_
-    );
-    auto data = RobStrideProtocol::createDisableCommand();
+    const auto frame = createDisableCommand();
 
-    if (transport_->send(id, data))
+    if (transport_->send(frame))
     {
         RCLCPP_INFO(
             rclcpp::get_logger("robstride_motor"),
-            "Motor %u Disable Command Sent.",
-            static_cast<unsigned>(motor_id_));
+            "Disable command sent: motor_id=%u bus=%s",
+            static_cast<unsigned>(motor_id_),
+            transport_->getInterfaceName().c_str());
         return true;
     }
     return false;
 }
 
 bool RobStrideMotor::sendMotionCommand(float torque, float position, float velocity, float kp, float kd)
+{
+    const auto frame = createMotionCommand(torque, position, velocity, kp, kd);
+    return transport_->send(frame);
+}
+
+CanTxFrameData RobStrideMotor::createMotionCommand(
+    float torque, float position, float velocity, float kp, float kd) const
 {
     // 부호 반전
     float hw_position = -position;
@@ -113,7 +100,45 @@ bool RobStrideMotor::sendMotionCommand(float torque, float position, float veloc
         limits_.kp_max, limits_.kd_max, 0.0f
     );
 
-    return transport_->send(id, data);
+    return CanTxFrameData{
+        id, std::move(data), motor_id_, "MOTION_CONTROL"};
+}
+
+CanTxFrameData RobStrideMotor::createEnableCommand() const
+{
+    return CanTxFrameData{
+        RobStrideProtocol::generateCommandId(
+            ProtocolCmd::MOTOR_ENABLE, master_id_, motor_id_),
+        RobStrideProtocol::createEnableCommand(),
+        motor_id_,
+        "ENABLE"};
+}
+
+CanTxFrameData RobStrideMotor::createDisableCommand() const
+{
+    return CanTxFrameData{
+        RobStrideProtocol::generateCommandId(
+            ProtocolCmd::MOTOR_STOP, master_id_, motor_id_),
+        RobStrideProtocol::createDisableCommand(),
+        motor_id_,
+        "DISABLE"};
+}
+
+CanTxFrameData RobStrideMotor::createCanTimeoutCommand(
+    uint32_t timeout_raw) const
+{
+    std::vector<uint8_t> data(8, 0);
+    constexpr uint16_t CAN_TIMEOUT_INDEX = 0x7028;
+    data[0] = static_cast<uint8_t>(CAN_TIMEOUT_INDEX & 0xFF);
+    data[1] = static_cast<uint8_t>(CAN_TIMEOUT_INDEX >> 8);
+    std::memcpy(&data[4], &timeout_raw, sizeof(timeout_raw));
+    constexpr uint8_t PARAM_WRITE_TYPE = 0x12;
+    return CanTxFrameData{
+        RobStrideProtocol::generateCommandId(
+            PARAM_WRITE_TYPE, master_id_, motor_id_),
+        std::move(data),
+        motor_id_,
+        "CAN_TIMEOUT_WRITE"};
 }
 
 void RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& rx_data)
@@ -151,8 +176,8 @@ void RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& r
 
     auto [p, v, t, temp, c] = RobStrideProtocol::parseFeedback(
         rx_data,
-        limits_.pos_limit, limits_.pos_limit,
-        limits_.vel_limit, limits_.vel_limit,
+        -limits_.pos_limit, limits_.pos_limit,
+        -limits_.vel_limit, limits_.vel_limit,
         limits_.torque_limit
     );
 
@@ -173,7 +198,7 @@ void RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& r
     }
 
     position_ = p;
-    velocity_ = v * getVelocityFeedbackScale(); // WJ: 선형 피드백 스케일링
+    velocity_ = v;
     torque_ = t;
     temperature_ = temp;
     current_ = c;

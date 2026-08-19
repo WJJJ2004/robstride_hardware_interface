@@ -47,6 +47,14 @@ uint16_t RobStrideProtocol::floatToUint(float x, float x_min, float x_max, int b
     return static_cast<uint16_t>((x - offset) * ((static_cast<float>(1 << bits) - 1)) / span);
 }
 
+float RobStrideProtocol::uintToFloat(
+    uint16_t x, float x_min, float x_max, int bits)
+{
+    const float span = x_max - x_min;
+    const float raw_max = static_cast<float>((1u << bits) - 1u);
+    return static_cast<float>(x) * span / raw_max + x_min;
+}
+
 std::vector<uint8_t> RobStrideProtocol::createMotionCommand(
     float p_des, float v_des, float kp, float kd, float /* t_ff */,
     float p_min, float p_max, float v_min, float v_max, float kp_max, float kd_max,
@@ -83,7 +91,7 @@ std::vector<uint8_t> RobStrideProtocol::createDisableCommand()
 
 std::tuple<float, float, float, float ,float> RobStrideProtocol::parseFeedback(
     const std::vector<uint8_t>& data,
-    float /* p_min */, float p_max, float /* v_min */, float v_max, float t_max)
+    float p_min, float p_max, float v_min, float v_max, float t_max)
 {
     if (data.size() < 8) return {0,0,0,0,0};
     uint16_t p_int = (data[0] << 8) | data[1];
@@ -91,9 +99,11 @@ std::tuple<float, float, float, float ,float> RobStrideProtocol::parseFeedback(
     uint16_t t_int = (data[4] << 8) | data[5];
     uint16_t temp_int = (data[6] << 8) | data[7];
 
-    float p = -((static_cast<float>(p_int) / 32767.0f) - 1.0f) * p_max;
-    float v = -((static_cast<float>(v_int) / 32767.0f) - 1.0f) * v_max;
-    float t = ((static_cast<float>(t_int) / 32767.0f) - 1.0f) * t_max;
+    // Position and velocity use the software sign convention, which is the
+    // inverse of the motor convention. Torque keeps the protocol sign.
+    float p = -uintToFloat(p_int, p_min, p_max, 16);
+    float v = -uintToFloat(v_int, v_min, v_max, 16);
+    float t = uintToFloat(t_int, -t_max, t_max, 16);
     float temp = static_cast<float>(temp_int) * 0.1f;
     // float c = t / 1.09f;
 

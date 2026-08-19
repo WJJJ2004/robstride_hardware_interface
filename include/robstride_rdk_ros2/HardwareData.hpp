@@ -76,6 +76,15 @@ struct MotorWriteStats
     uint32_t consecutive_failures{0};
 };
 
+struct BusSendReport
+{
+    WorkerResult result{WorkerResult::Idle};
+    std::size_t requested{0};
+    std::size_t queued{0};
+    int error_number{0};
+    std::vector<uint16_t> failed_motor_ids;
+};
+
 struct BusWorkerStatus
 {
     WorkerOperation last_operation{WorkerOperation::None};
