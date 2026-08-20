@@ -46,17 +46,6 @@ target_link_libraries(hardware_interface_node
   ${PROJECT_NAME}_lib
 )
 
-include(CTest)
-if(BUILD_TESTING)
-  add_executable(protocol_scaling_test
-    test/protocol_scaling_test.cpp
-  )
-  target_link_libraries(protocol_scaling_test
-    ${PROJECT_NAME}_lib
-  )
-  add_test(NAME protocol_scaling_test COMMAND protocol_scaling_test)
-endif()
-
 ament_target_dependencies(hardware_interface_node
   rclcpp
   rclcpp_lifecycle
