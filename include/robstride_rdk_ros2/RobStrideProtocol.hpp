@@ -44,8 +44,9 @@ public:
     static std::vector<uint8_t> createEnableCommand();
     static std::vector<uint8_t> createDisableCommand();
 
-    // 피드백 데이터 파싱
-    // 리턴: <Position, Velocity, Torque, Temperature , Current>
+    // Decode raw protocol coordinates. Joint direction is applied by
+    // RobStrideMotor after parsing.
+    // Return: <Position, Velocity, Torque, Temperature, Current>
     static std::tuple<float, float, float, float, float> parseFeedback(
         const std::vector<uint8_t>& data,
         float p_min, float p_max, float v_min, float v_max, float t_max

@@ -99,10 +99,11 @@ std::tuple<float, float, float, float ,float> RobStrideProtocol::parseFeedback(
     uint16_t t_int = (data[4] << 8) | data[5];
     uint16_t temp_int = (data[6] << 8) | data[7];
 
-    // Position and velocity use the software sign convention, which is the
-    // inverse of the motor convention. Torque keeps the protocol sign.
-    float p = -uintToFloat(p_int, p_min, p_max, 16);
-    float v = -uintToFloat(v_int, v_min, v_max, 16);
+    // Decode protocol values without applying a joint-coordinate convention.
+    // The owning RobStrideMotor applies its motor-specific direction so the
+    // same conversion is used for both command and feedback paths.
+    float p = uintToFloat(p_int, p_min, p_max, 16);
+    float v = uintToFloat(v_int, v_min, v_max, 16);
     float t = uintToFloat(t_int, -t_max, t_max, 16);
     float temp = static_cast<float>(temp_int) * 0.1f;
     // float c = t / 1.09f;

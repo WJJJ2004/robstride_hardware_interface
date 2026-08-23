@@ -2,6 +2,20 @@
 #include <rclcpp/rclcpp.hpp>
 #include <cstring>
 
+namespace
+{
+
+// Convert between the ROS/model joint convention and the motor protocol
+// convention. The hip-yaw axes in the deployed model assets are opposite to
+// the physical joint axes, so IDs 14 and 15 intentionally bypass the global
+// sign inversion used by the other motors.
+constexpr float positionVelocityDirection(const uint8_t motor_id)
+{
+    return (motor_id == 14U || motor_id == 15U) ? 1.0f : -1.0f;
+}
+
+}  // namespace
+
 RobStrideMotor::RobStrideMotor(std::shared_ptr<CanTransport> transport, uint8_t motor_id, ActuatorType type)
     : transport_(transport), motor_id_(motor_id), type_(type)
 {
@@ -84,9 +98,9 @@ bool RobStrideMotor::sendMotionCommand(float torque, float position, float veloc
 CanTxFrameData RobStrideMotor::createMotionCommand(
     float torque, float position, float velocity, float kp, float kd) const
 {
-    // 부호 반전
-    float hw_position = -position;
-    float hw_velocity = -velocity;
+    const float direction = positionVelocityDirection(motor_id_);
+    const float hw_position = direction * position;
+    const float hw_velocity = direction * velocity;
 
     uint16_t t_uint = RobStrideProtocol::floatToUint(torque, -limits_.torque_limit, limits_.torque_limit, 16);
 
@@ -180,6 +194,12 @@ void RobStrideMotor::processPacket(uint32_t rx_id, const std::vector<uint8_t>& r
         -limits_.vel_limit, limits_.vel_limit,
         limits_.torque_limit
     );
+
+    // Keep all state used by initialization, interpolation, filtering, and
+    // ROS publication in the same model-coordinate convention as commands.
+    const float direction = positionVelocityDirection(motor_id_);
+    p *= direction;
+    v *= direction;
 
     if (!std::isfinite(p) ||
         !std::isfinite(v) ||
