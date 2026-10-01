@@ -152,9 +152,9 @@ private:
     std::vector<MotorStateData> latest_motor_states_;
 
     rclcpp::TimerBase::SharedPtr timer_;
-    double control_frequency_hz_{150.0};
+    double control_frequency_hz_{200.0};
     double initial_interpolation_duration_sec_{1.0};
-    std::chrono::nanoseconds control_loop_period_{std::chrono::nanoseconds(3333333)};
+    std::chrono::nanoseconds control_loop_period_{std::chrono::nanoseconds(5000000)};
     rclcpp::Subscription<roa_interfaces::msg::MotorCommandArray>::SharedPtr walk_sub;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr torque_sub;
     rclcpp::Publisher<roa_interfaces::msg::MotorStateArray>::SharedPtr state_pub;

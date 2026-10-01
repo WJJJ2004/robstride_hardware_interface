@@ -53,7 +53,7 @@ MainControlNode::~MainControlNode()
 void MainControlNode::initParameters()
 {
     declare_parameter("baud_rate", 1000000);
-    declare_parameter("control_frequency_hz", 150.0);
+    declare_parameter("control_frequency_hz", 200.0);
     declare_parameter("initial_interpolation_duration_sec", 1.0);
     declare_parameter<std::vector<std::string>>("can_interfaces", {"can0"});
 
@@ -1278,14 +1278,15 @@ void MainControlNode::handle_read_packet()
     msg.header.frame_id = "motor_states";
 
     auto current_time = std::chrono::steady_clock::now();
-    float dt_sec = 0.01f;
+    const float nominal_dt_sec = 1.0f / static_cast<float>(control_frequency_hz_);
+    float dt_sec = nominal_dt_sec;
     if (velocity_filter_time_initialized_)
     {
         dt_sec = std::chrono::duration<float>(current_time - last_velocity_filter_time_).count();
     }
     if (dt_sec <= 0.0f || dt_sec > 0.1f)
     {
-        dt_sec = 0.01f;
+        dt_sec = nominal_dt_sec;
     }
     last_velocity_filter_time_ = current_time;
     velocity_filter_time_initialized_ = true;
