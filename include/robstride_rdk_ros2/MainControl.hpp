@@ -11,7 +11,6 @@
 #include "CanTransport.hpp"
 #include "CanBusWorker.hpp"
 #include "HardwareData.hpp"
-#include "filter.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "roa_interfaces/msg/motor_state.hpp"
@@ -177,10 +176,6 @@ private:
     static constexpr uint32_t MOTOR_CAN_TIMEOUT_RAW = 3000; // 150 ms at 1/20000 s
 
     std::mutex command_mutex_;
-
-    std::vector<Butterworth2ndOrderLPF> velocity_filters_;
-    std::chrono::steady_clock::time_point last_velocity_filter_time_;
-    bool velocity_filter_time_initialized_ = false;
 
     // 초기 set 자세
     bool walk_initialized_ = false;

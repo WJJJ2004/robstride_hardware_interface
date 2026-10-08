@@ -603,15 +603,6 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
         "can_interfaces=%zu total_motors=%zu",
         configured_motor_ids.c_str(), can_groups_.size(), all_motors_.size());
 
-    velocity_filters_.clear();
-    velocity_filters_.reserve(all_motors_.size());
-    for (size_t i = 0; i < all_motors_.size(); i++)
-    {
-        velocity_filters_.emplace_back(3.0f); // 23 hz -> 10 hz로 낮춰서 더 부드럽게
-    }
-    last_velocity_filter_time_ = std::chrono::steady_clock::now();
-    velocity_filter_time_initialized_ = false;
-
     return CallbackReturn::SUCCESS;
 }
 
@@ -710,19 +701,6 @@ CallbackReturn MainControlNode::on_activate(
         return CallbackReturn::FAILURE;
     }
     torque_enabled_ = true;
-
-    velocity_filters_.clear();
-    velocity_filters_.reserve(all_motors_.size());
-
-    for (size_t i = 0; i < all_motors_.size(); ++i)
-    {
-        velocity_filters_.emplace_back(3.0f);
-    }
-
-    last_velocity_filter_time_ =
-        std::chrono::steady_clock::now();
-
-    velocity_filter_time_initialized_ = false;
 
     startControlLoopTimer();
 
@@ -1277,20 +1255,6 @@ void MainControlNode::handle_read_packet()
     msg.header.stamp = this->get_clock()->now();
     msg.header.frame_id = "motor_states";
 
-    auto current_time = std::chrono::steady_clock::now();
-    const float nominal_dt_sec = 1.0f / static_cast<float>(control_frequency_hz_);
-    float dt_sec = nominal_dt_sec;
-    if (velocity_filter_time_initialized_)
-    {
-        dt_sec = std::chrono::duration<float>(current_time - last_velocity_filter_time_).count();
-    }
-    if (dt_sec <= 0.0f || dt_sec > 0.1f)
-    {
-        dt_sec = nominal_dt_sec;
-    }
-    last_velocity_filter_time_ = current_time;
-    velocity_filter_time_initialized_ = true;
-
     for (size_t i = 0; i < all_motors_.size(); i++)
     {
         msg.states[i].motor_id = motor_ids_[i];
@@ -1386,14 +1350,9 @@ void MainControlNode::handle_read_packet()
                 }
             }
 
-            float velocity = raw_velocity;
-            if (i < velocity_filters_.size())
-            {
-                velocity = velocity_filters_[i].filter(raw_velocity, dt_sec);
-            }
-
             msg.states[i].position = wrapped_pos;
-            msg.states[i].velocity = velocity;
+            // M1 no-load setup: decoded model-coordinate velocity, no host LPF.
+            msg.states[i].velocity = raw_velocity;
             msg.states[i].current  = current;
         }
         else
@@ -1403,15 +1362,7 @@ void MainControlNode::handle_read_packet()
 
             // 마지막 정상값 유지
             msg.states[i].position = wrapToPi(latest_motor_states_[i].position);
-            {
-                const float raw_velocity = latest_motor_states_[i].velocity;
-                float velocity = raw_velocity;
-                if (i < velocity_filters_.size())
-                {
-                    velocity = velocity_filters_[i].filter(raw_velocity, dt_sec);
-                }
-                msg.states[i].velocity = velocity;
-            }
+            msg.states[i].velocity = latest_motor_states_[i].velocity;
             msg.states[i].current = latest_motor_states_[i].current;
 
             // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
