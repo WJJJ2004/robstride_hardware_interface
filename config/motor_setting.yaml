@@ -1,5 +1,5 @@
 # Full-body 23-motor registration from local HW revision 1bea3d3.
-# Deployment uses 200 Hz HW and 50 Hz policy; host qd filtering removed in source.
+# Deployment uses 50 Hz HW and 50 Hz policy; host qd filtering removed in source.
 hardware_interface_node:
   ros__parameters:
     can_interfaces:
@@ -8,7 +8,7 @@ hardware_interface_node:
     - can_right_leg
     - can_left_leg
     baud_rate: 1000000
-    control_frequency_hz: 200.0
+    control_frequency_hz: 50.0
     can_right_arm:
       motor_ids:
       - 22

@@ -53,7 +53,7 @@ MainControlNode::~MainControlNode()
 void MainControlNode::initParameters()
 {
     declare_parameter("baud_rate", 1000000);
-    declare_parameter("control_frequency_hz", 200.0);
+    declare_parameter("control_frequency_hz", 50.0);
     declare_parameter("initial_interpolation_duration_sec", 1.0);
     declare_parameter<std::vector<std::string>>("can_interfaces", {"can0"});
 
