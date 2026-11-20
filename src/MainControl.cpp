@@ -54,6 +54,12 @@ void MainControlNode::initParameters()
 {
     declare_parameter("baud_rate", 1000000);
     declare_parameter("control_frequency_hz", 200.0);
+    declare_parameter("rsu_control_mode", std::string("impedance"));
+    declare_parameter("rsu_motor_torque_limit", 11.9);
+    declare_parameter("rsu_torque_timeout_ms", 20.0);
+    declare_parameter("rsu_feedback_timeout_ms", 20.0);
+    declare_parameter("rsu_target_timeout_ms", 100.0);
+    declare_parameter("upper_command_timeout_ms", 50.0);
     declare_parameter("initial_interpolation_duration_sec", 1.0);
     declare_parameter<std::vector<std::string>>("can_interfaces", {"can0"});
 
@@ -398,6 +404,8 @@ void MainControlNode::resetRuntimeStates()
     last_read_cycle_all_updated_ = false;
 
     packet_initialized_ = false;
+    last_upper_command_time_ = {};
+    if (rsu_torque_gate_) rsu_torque_gate_->reset();
     initial_raw_position_printed_ = false;
 
     motor_feedback_seen_.assign(
@@ -448,6 +456,56 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
         return CallbackReturn::FAILURE;
     }
 
+    const auto rsu_mode = get_parameter("rsu_control_mode").as_string();
+    if (rsu_mode != "impedance" && rsu_mode != "torque") {
+        RCLCPP_ERROR(get_logger(), "Invalid rsu_control_mode");
+        return CallbackReturn::FAILURE;
+    }
+    rsu_torque_mode_ = rsu_mode == "torque";
+    if (rsu_torque_mode_ && control_frequency_hz_ != 200.0) {
+        RCLCPP_ERROR(get_logger(), "RSU torque mode requires 200 Hz HW control");
+        return CallbackReturn::FAILURE;
+    }
+    upper_command_timeout_ms_ = get_parameter("upper_command_timeout_ms").as_double();
+    if (!std::isfinite(upper_command_timeout_ms_) || upper_command_timeout_ms_ <= 0) {
+        return CallbackReturn::FAILURE;
+    }
+    try {
+        rsu_torque_gate_ = std::make_unique<rsu_torque::Ownership>(
+            get_parameter("rsu_motor_torque_limit").as_double(),
+            get_parameter("rsu_torque_timeout_ms").as_double(),
+            get_parameter("rsu_feedback_timeout_ms").as_double(),
+            get_parameter("rsu_target_timeout_ms").as_double());
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "RSU torque configuration: %s", e.what());
+        return CallbackReturn::FAILURE;
+    }
+    if (rsu_torque_mode_) {
+        rsu_torque_sub_ = create_subscription<roa_interfaces::msg::RsuTorqueCommand>(
+            "/rsu/torque_command", rclcpp::QoS(1).best_effort(),
+            [this](roa_interfaces::msg::RsuTorqueCommand::SharedPtr msg) {
+                // Position initialization retains the existing path. Ownership
+                // switches after RUNNING when the policy RT packet is ready; later faults require reactivation.
+                if (!torque_enabled_ ||
+                    policy_state_ == SystemPolicyState::FROZEN ||
+                    policy_state_ == SystemPolicyState::ESTOPPED) return;
+                bool accepted;
+                {
+                    std::lock_guard<std::mutex> lock(command_mutex_);
+                    accepted = rsu_torque_gate_->receive(*msg, now().nanoseconds(),
+                        std::chrono::steady_clock::now());
+                }
+                if (!accepted) {
+                    if (init_phase_ == InitPhase::RUNNING)
+                        enterFrozen("RSU torque command invalid, stale or reordered");
+                    else {
+                        std::lock_guard<std::mutex> lock(command_mutex_);
+                        rsu_torque_gate_->reset();
+                    }
+                }
+            });
+    }
+
     // if (!canSetup())
     // {
     //     RCLCPP_ERROR(this->get_logger(), "[Configure] CAN setup failed");
@@ -483,6 +541,20 @@ CallbackReturn MainControlNode::on_configure(const rclcpp_lifecycle::State &)
     motor_ids_.clear();
     motor_id_to_index_.clear();
     packet_index_to_bus_.clear();
+
+    if (rsu_torque_mode_) {
+        std::array<int,4> counts{};
+        for (const auto& bus : can_interfaces) {
+            for (auto id : get_parameter(bus + ".motor_ids").as_integer_array()) {
+                const int i = rsu_torque::index(static_cast<uint16_t>(id));
+                if (i >= 0) ++counts[i];
+            }
+        }
+        for (auto n : counts) if (n != 1) {
+            RCLCPP_ERROR(get_logger(), "Torque mode requires exactly motors 18,20,19,21");
+            return CallbackReturn::FAILURE;
+        }
+    }
 
     for (const auto& can_name : can_interfaces)
     {
@@ -1565,6 +1637,23 @@ void MainControlNode::handle_write_packet()
         command_snapshot = packet_commands_;
     }
 
+    if (rsu_torque_mode_ && init_phase_ == InitPhase::RUNNING) {
+        bool safe;
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            const auto steady_now = std::chrono::steady_clock::now();
+            safe = last_upper_command_time_ != std::chrono::steady_clock::time_point{} &&
+                std::chrono::duration<double,std::milli>(steady_now - last_upper_command_time_).count()
+                    <= upper_command_timeout_ms_ &&
+                (rsu_torque_gate_->apply(command_snapshot, now().nanoseconds(), steady_now)
+                    != rsu_torque::OwnershipResult::Fault);
+        }
+        if (!safe) {
+            enterFrozen("Missing, stale or invalid RSU torque / upper command; no impedance fallback");
+            return;
+        }
+    }
+
     float alpha = 0.0f;
     if (init_phase_ == InitPhase::INTERPOLATING)
     {
@@ -1673,8 +1762,26 @@ void MainControlNode::walkCallback(
 {
 
     publishWalkInitialized(walk_initialized_);
+    if (rsu_torque_mode_) {
+        std::unordered_map<uint16_t,int> counts;
+        bool valid = true;
+        for (const auto& c : msg->commands) {
+            // Unknown upper-body IDs may be present when a subset is configured.
+            if (motor_id_to_index_.count(c.motor_id)) ++counts[c.motor_id];
+            valid = valid && std::isfinite(c.position) && std::isfinite(c.velocity) &&
+                std::isfinite(c.kp) && std::isfinite(c.kd) && std::isfinite(c.torque);
+        }
+        for (auto id : motor_ids_) valid = valid && counts[id] == 1;
+        valid = valid && rsu_torque::fresh(now().nanoseconds(),
+            rsu_torque::stamp_ns(msg->header.stamp), upper_command_timeout_ms_);
+        if (!valid) {
+            if (init_phase_ == InitPhase::RUNNING) enterFrozen("Invalid upper command packet");
+            return;
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(command_mutex_);
+        last_upper_command_time_ = std::chrono::steady_clock::now();
 
         packet_commands_.header = msg->header;
 

@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 project(robstride_hardware_interface)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -79,4 +81,16 @@ install(DIRECTORY include/
   DESTINATION include
 )
 
+add_executable(rsu_torque_mock src/rsu_torque_mock.cpp)
+target_include_directories(rsu_torque_mock PRIVATE include)
+target_link_libraries(rsu_torque_mock ${PROJECT_NAME}_lib)
+ament_target_dependencies(rsu_torque_mock rclcpp std_msgs roa_interfaces)
+install(TARGETS rsu_torque_mock DESTINATION lib/${PROJECT_NAME})
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_rsu_torque_gate test/test_rsu_torque_gate.cpp)
+  target_include_directories(test_rsu_torque_gate PRIVATE include)
+  target_link_libraries(test_rsu_torque_gate ${PROJECT_NAME}_lib)
+  ament_target_dependencies(test_rsu_torque_gate rclcpp roa_interfaces)
+endif()
 ament_package()
